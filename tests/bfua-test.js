@@ -248,6 +248,22 @@ assertEq(local.ups['9'].name, '新UP', 'new up entry created');
 assertEq(local.globalFloorTs, Core.dateStrToTs('2025-01-01'), 'globalFloorTs merged as min (deeper)');
 assertEq(local.lastScanTs, 4000, 'lastScanTs merged as max');
 
+// ---- pageForAnchor (list position preserved across scans) ----
+console.log('\n# pageForAnchor');
+const anchorList = Array.from({ length: 45 }, (_, i) => ({ bvid: 'v' + (i + 1), pubTs: i + 1 })); // 45 items / 20 per page = 3 pages
+assertEq(Core.pageForAnchor(anchorList, 'v1', 20), 1, 'first item -> page 1');
+assertEq(Core.pageForAnchor(anchorList, 'v20', 20), 1, 'page boundary last item -> page 1');
+assertEq(Core.pageForAnchor(anchorList, 'v21', 20), 2, 'page boundary first item -> page 2');
+assertEq(Core.pageForAnchor(anchorList, 'v45', 20), 3, 'last item -> last page');
+// simulate 10 new videos prepended before old v21 (old index 20 -> new index 30)
+const grown = [...Array.from({ length: 10 }, (_, i) => ({ bvid: 'new' + i, pubTs: 100 + i })), ...anchorList];
+assertEq(Core.pageForAnchor(grown, 'v21', 20), 2, 'anchor shifted by 10 new items still lands on its page');
+assertEq(grown[(2 - 1) * 20].bvid, 'v11', 'sanity: new page 2 starts at old v11');
+assertOk(grown.slice(20, 40).some((v) => v.bvid === 'v21'), 'new page 2 contains the anchor video');
+assertEq(Core.pageForAnchor(anchorList, 'nonexist', 20), 1, 'unknown anchor -> fallback page 1');
+assertEq(Core.pageForAnchor(anchorList, null, 20), 1, 'no anchor -> page 1');
+assertEq(Core.pageForAnchor([], 'v1', 20), 1, 'empty list -> page 1');
+
 // ---- summary ----
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

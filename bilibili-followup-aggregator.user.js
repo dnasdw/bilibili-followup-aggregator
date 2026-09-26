@@ -2,7 +2,7 @@
 // @name         B站关注动态聚合器 - 视频补课与增量归档
 // @name:en      Bilibili Follow Feed Aggregator - Video Backfill & Incremental Archive
 // @namespace    https://github.com/dnasdw
-// @version      1.6.0
+// @version      1.7.0
 // @description  聚合全部关注UP主的视频动态（正式投稿+动态视频），按发布时间重建完整时间线。绕过B站关注动态页只能回看约75天历史的限制：支持从任意日期回溯补课（可扫到每个UP的第一条动态）、增量归档、断点续扫、新关注UP自动补全、多设备迁移
 // @description:en  Aggregate video dynamics (uploads + dynamic videos) from all followed creators into one timeline. Bypasses bilibili's ~75-day follow-feed history limit: backfill from any date (down to each creator's very first post), incremental updates, resumable scans, auto-backfill for newly followed creators, JSON export/import for migration.
 // @author       dnasdw
@@ -258,6 +258,19 @@
 
         sortedList(map) {
             return Object.values(map).sort((a, b) => b.pubTs - a.pubTs);
+        },
+
+        /**
+         * After new items are prepended by a scan, jump to the page that still
+         * contains the anchor video (the first visible item before the scan),
+         * so the user continues exactly where they left off.
+         * Returns 1 when there is no/unknown anchor (fresh library, deleted video).
+         */
+        pageForAnchor(sortedList, anchorBvid, pageSize) {
+            if (!anchorBvid) return 1;
+            const idx = sortedList.findIndex((v) => v.bvid === anchorBvid);
+            if (idx < 0) return 1;
+            return Math.floor(idx / pageSize) + 1;
         },
 
         /** Parse followings page -> { list: [{mid, uname}], total } */
@@ -611,6 +624,7 @@
             this.running = true;
             this.stopFlag = false;
             UI.setScanning(true);
+            UI.captureAnchor(); // remember where the user was before data changes
 
             const state = Store.load();
             try {
@@ -687,7 +701,7 @@
                 Store.save(state);
                 UI.log(`扫描完成：库中共 ${totalVids} 条视频，错误 ${scan.errors.length} 个`);
                 UI.renderStats();
-                UI.renderList(1);
+                UI.renderListAnchored();
             } catch (e) {
                 UI.log(`扫描中断：${e.message}`, 'error');
                 Store.save(state);
@@ -845,8 +859,7 @@
             this.els.stop.addEventListener('click', () => ScanEngine.stop());
             this.els.exportBtn.addEventListener('click', () => this.exportJson());
             this.els.importBtn.addEventListener('click', () => {
-                if (ScanEngine.running) { this.log('扫描进行中，请先停止再导入', 'warn'); return; }
-                this.els.importFile.value = '';
+                if (ScanEngine.running) { this.log('扫描进行中，请先停止再导入', 'warn'); return; }                this.els.importFile.value = '';
                 this.els.importFile.click();
             });
             this.els.importFile.addEventListener('change', () => {
@@ -857,6 +870,7 @@
                 if (ScanEngine.running) { this.log('扫描进行中，请先停止', 'warn'); return; }
                 if (!confirm('确定清空全部已聚合的视频数据？')) return;
                 Store.clear();
+                this.anchorBvid = null;
                 this.savePage(1);
                 this.renderStats();
                 this.renderList(1);
@@ -925,6 +939,30 @@
         },
 
         currentPage: 1,
+        anchorBvid: null, // in-memory only (never persisted): first visible item when a scan starts
+
+        /**
+         * Capture the first visible item of the currently viewed page as the
+         * resume anchor. Called at the start of EVERY scan run (full/increment/
+         * resume), so the anchor always reflects where the user is right now.
+         */
+        captureAnchor() {
+            this.anchorBvid = null;
+            const state = Store.load();
+            const list = Core.sortedList(state.videos);
+            if (!list.length) return;
+            const pages = Math.ceil(list.length / CONFIG.listPageSize);
+            const page = Math.min(this.loadPage() || 1, pages);
+            const first = list[(page - 1) * CONFIG.listPageSize];
+            if (first) this.anchorBvid = first.bvid;
+        },
+
+        /** Re-render the list positioned so the anchor video is still visible. */
+        renderListAnchored() {
+            const state = Store.load();
+            const list = Core.sortedList(state.videos);
+            this.renderList(Core.pageForAnchor(list, this.anchorBvid, CONFIG.listPageSize));
+        },
 
         /** persist current page in localStorage (separate from GM scan state to avoid write races) */
         savePage(page) {
