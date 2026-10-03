@@ -2,7 +2,7 @@
 // @name         B站关注动态聚合器 - 视频补课与增量归档
 // @name:en      Bilibili Follow Feed Aggregator - Video Backfill & Incremental Archive
 // @namespace    https://github.com/dnasdw
-// @version      2.1.0
+// @version      2.1.1
 // @description  聚合全部关注UP主的视频动态（正式投稿+动态视频），按发布时间重建完整时间线。绕过B站关注动态页只能回看约75天历史的限制：支持从任意日期回溯补课（可扫到每个UP的第一条动态）、增量归档、断点续扫、新关注UP自动补全、多设备迁移
 // @description:en  Aggregate video dynamics (uploads + dynamic videos) from all followed creators into one timeline. Bypasses bilibili's ~75-day follow-feed history limit: backfill from any date (down to each creator's very first post), incremental updates, resumable scans, auto-backfill for newly followed creators, JSON export/import for migration.
 // @author       dnasdw
@@ -53,7 +53,7 @@
         followings: (mid, pn) => `https://api.bilibili.com/x/relation/followings?vmid=${mid}&pn=${pn}&ps=50&order=desc`,
         feedSpace: (mid, offset) => `https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space?host_mid=${mid}&offset=${encodeURIComponent(offset)}&platform=web&features=itemOpusStyle`,
         feedPgc: (offset) => `https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all?type=pgc&offset=${encodeURIComponent(offset)}&platform=web&features=itemOpusStyle`,
-        collectedList: (mid, pn) => `https://api.bilibili.com/x/v3/fav/folder/collected/list?up_mid=${mid}&pn=${pn}&ps=20`,
+        collectedList: (mid, pn) => `https://api.bilibili.com/x/v3/fav/folder/collected/list?up_mid=${mid}&pn=${pn}&ps=20&platform=web`,
         seasonArchives: (mid, seasonId, pn) => `https://api.bilibili.com/x/polymer/web-space/seasons_archives_list?mid=${mid}&season_id=${seasonId}&page_num=${pn}&page_size=30&sort_reverse=false`,
         bangumiFollow: (mid, type, pn) => `https://api.bilibili.com/x/space/bangumi/follow/list?vmid=${mid}&type=${type}&pn=${pn}&ps=30`,
     };
