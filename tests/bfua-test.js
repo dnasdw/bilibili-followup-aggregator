@@ -264,6 +264,140 @@ assertEq(Core.pageForAnchor(anchorList, 'nonexist', 20), 1, 'unknown anchor -> f
 assertEq(Core.pageForAnchor(anchorList, null, 20), 1, 'no anchor -> page 1');
 assertEq(Core.pageForAnchor([], 'v1', 20), 1, 'empty list -> page 1');
 
+// ---- v2: sources/seasons/pgc/tabs/prune ----
+console.log('\n# v2.0 features');
+
+// parsePgcPage
+const pgcJson = {
+    data: {
+        has_more: true, offset: '555',
+        items: [
+            {
+                type: 'DYNAMIC_TYPE_PGC',
+                modules: {
+                    module_author: { mid: 928123, name: '番剧出差', face: 'http://i0.hdslb.com/face/x.jpg', pub_ts: 1750000000 },
+                    module_dynamic: { major: { pgc: { epid: 888888, season_id: 777, title: '某番剧', sub_title: '第2话', cover: 'http://i0.hdslb.com/pgc/x.jpg', url: '//www.bilibili.com/bangumi/play/ep888888', season_type: 1 } } },
+                },
+            },
+            {
+                type: 'DYNAMIC_TYPE_PGC',
+                modules: {
+                    module_author: { mid: 928123, name: '番剧出差', face: '', pub_ts: 1740000000 },
+                    module_dynamic: { major: { pgc: { epid: 999999, season_id: 778, title: '某电视剧', sub_title: '更新', cover: '', url: '', season_type: 5 } } },
+                },
+            },
+            { type: 'DYNAMIC_TYPE_AV', modules: { module_author: { mid: 1, pub_ts: 1750000100 }, module_dynamic: { major: { archive: { bvid: 'BVx' } } } } },
+        ],
+    },
+};
+const pgcPage = Core.parsePgcPage(pgcJson, 0);
+assertEq(pgcPage.videos.length, 2, 'pgc items collected, AV item skipped');
+assertEq(pgcPage.videos[0].bvid, 'ep888888', 'pseudo bvid ep{id}');
+assertEq(pgcPage.videos[0].badge, '追番', 'anime badge');
+assertEq(pgcPage.videos[1].badge, '追剧', 'drama badge (season_type 5)');
+assertEq(pgcPage.videos[0].url, 'https://www.bilibili.com/bangumi/play/ep888888', 'protocol-relative url fixed');
+assertEq(pgcPage.videos[0].url2 !== undefined ? 1 : (pgcPage.videos[1].url.indexOf('https://') === 0 ? 1 : 0), 1, 'empty url falls back to ep page');
+assertEq(pgcPage.videos[0].sources, ['pgc'], 'pgc sources');
+assertEq(pgcPage.ups['928123'].face, 'https://i0.hdslb.com/face/x.jpg', 'pgc author face http->https');
+assertEq(Core.parsePgcPage(pgcJson, 1745000000).videos.length, 1, 'sinceTs filters old pgc items');
+
+// parseSeasonPage
+const seasonJson = {
+    data: {
+        archives: [
+            { aid: 1, bvid: 'BVs1', title: '第一集', pic: 'http://i0.hdslb.com/bfs/archive/s1.jpg', duration: 3661, pubdate: 1730000001 },
+            { aid: 2, bvid: 'BVs2', title: '第二集', pic: '', duration: 59, pubdate: 1730000002 },
+            { aid: 3, bvid: '', title: 'broken', pubdate: 1730000003 },
+        ],
+        meta: { season_id: 12345, mid: 42, name: '某合集', cover: 'http://i0.hdslb.com/s.jpg', total: 35 },
+        page: { page_num: 1, total: 35 },
+    },
+};
+const seasonPage = Core.parseSeasonPage(seasonJson, 0);
+assertEq(seasonPage.videos.length, 2, 'broken entry skipped');
+assertEq(seasonPage.videos[0].sources, ['season'], 'season sources');
+assertEq(seasonPage.videos[0].duration, '1:01:01', 'duration formatted h:mm:ss');
+assertEq(seasonPage.videos[1].duration, '0:59', 'duration formatted m:ss');
+assertEq(seasonPage.videos[0].seasonId, '12345', 'seasonId recorded');
+assertEq(seasonPage.meta.name, '某合集', 'meta name');
+assertEq(seasonPage.hasMore, true, 'paging by total count');
+assertEq(Core.parseSeasonPage(seasonJson, 1730000002).videos.length, 1, 'sinceTs filters episodes');
+
+// parseCollectedList
+const colPage = Core.parseCollectedList({ data: { count: 2, list: [
+    { id: 12345, title: '某合集', mid: 42, media_count: 35 },
+    { fid: 999, title: '某收藏夹', mid: 7, media_count: 10 }, // no id? fid only -> kept via id fallback? fid not mapped, id undefined -> filtered
+] } });
+assertEq(colPage.list.length, 1, 'entries without usable id filtered');
+assertEq(colPage.list[0].id, '12345', 'id stringified');
+
+// mergeVideos: sources union
+const mv = {};
+Core.mergeVideos(mv, [{ bvid: 'BVx', title: 't', pubTs: 1, sources: ['follow'] }]);
+const addedX = Core.mergeVideos(mv, [{ bvid: 'BVx', title: 't', pubTs: 1, sources: ['season'] }]);
+assertEq(addedX, 0, 'cross-source merge is not a new record');
+assertEq(mv.BVx.sources.slice().sort(), ['follow', 'season'], 'sources unioned');
+
+// fmtDuration edge cases
+assertEq(Core.fmtDuration(0), '0:00', 'zero duration');
+assertEq(Core.fmtDuration(3599), '59:59', 'below one hour');
+
+// migrateV2ToV3
+const v2state = { version: 2, videos: { a: { bvid: 'a', pubTs: 1 } }, ups: {}, globalFloorTs: 100, lastScanTs: 200 };
+const v3state = Core.migrateV2ToV3(v2state);
+assertEq(v3state.version, 3, 'version 3');
+assertEq(v3state.videos.a.sources, ['follow'], 'legacy video gains follow source');
+assertEq(v3state.seasons, {}, 'empty seasons table');
+assertEq(v3state.settings.defaultTab, 'all', 'settings defaults');
+assertEq(v3state.settings.delOnUnsubscribe, true, 'delOnUnsubscribe default on');
+assertEq(v3state.settings.delOnUnfollow, true, 'delOnUnfollow default on');
+
+// filterByTab
+const tabList = [
+    { bvid: 'a', sources: ['follow'] },
+    { bvid: 'b', sources: ['pgc'] },
+    { bvid: 'c', sources: ['follow', 'season'] },
+    { bvid: 'd', sources: ['season'] },
+];
+assertEq(Core.filterByTab(tabList, 'all').length, 4, 'all tab keeps everything');
+assertEq(Core.filterByTab(tabList, 'follow').map((v) => v.bvid), ['a', 'c'], 'follow tab');
+assertEq(Core.filterByTab(tabList, 'pgc').map((v) => v.bvid), ['b'], 'pgc tab');
+assertEq(Core.filterByTab(tabList, 'season').map((v) => v.bvid), ['c', 'd'], 'season tab incl. cross-source');
+
+// pruneSources
+const pstate = {
+    videos: {
+        fo: { bvid: 'fo', upMid: '1', seasonId: '', sources: ['follow'] },          // followed only
+        fs: { bvid: 'fs', upMid: '1', seasonId: '11', sources: ['follow', 'season'] }, // cross-source, season STILL subscribed
+        fs2: { bvid: 'fs2', upMid: '1', seasonId: '22', sources: ['follow', 'season'] }, // cross-source, both dropped
+        se: { bvid: 'se', upMid: '2', seasonId: '22', sources: ['season'] },        // season only, unsubscribed
+        pg: { bvid: 'pg', upMid: '3', seasonId: '', sources: ['pgc'] },             // pgc - untouched
+    },
+    ups: { '1': { mid: '1', lastTs: 100 }, '2': { mid: '2', lastTs: 100 } },
+    seasons: { '11': { seasonId: '11', lastTs: 1 }, '22': { seasonId: '22', lastTs: 1 }, '33': { seasonId: '33', lastTs: 1 } },
+};
+// live: only UP 2 and season 11 remain
+const pr1 = Core.pruneSources(pstate, new Set(['2']), new Set(['11']), { delOnUnfollow: true, delOnUnsubscribe: true });
+assertEq(pstate.videos.fo, undefined, 'follow-only video of unfollowed UP deleted');
+assertEq(pstate.videos.fs.sources, ['season'], 'cross-source video survives via still-subscribed season (removed from follow tab only)');
+assertEq(pstate.videos.fs2, undefined, 'cross-source video deleted after BOTH tags removed');
+assertEq(pstate.videos.se, undefined, 'season-only video of unsubscribed season deleted');
+assertEq(pstate.videos.pg.bvid, 'pg', 'pgc video never pruned');
+assertEq(pstate.seasons['22'], undefined, 'unsubscribed season entry removed');
+assertEq(pstate.seasons['11'].seasonId, '11', 'live season entry kept');
+assertEq(pstate.ups['1'].lastTs, 0, 'unfollowed UP lastTs reset (re-follow triggers full backfill)');
+assertEq(pstate.ups['2'].lastTs, 100, 'followed UP lastTs untouched');
+
+const pstate2 = {
+    videos: { fs: { bvid: 'fs', upMid: '1', seasonId: '11', sources: ['follow', 'season'] } },
+    ups: { '1': { mid: '1', lastTs: 100 } },
+    seasons: { '11': { seasonId: '11', lastTs: 1 } },
+};
+// season 11 unsubscribed + UP unfollowed, but delOnUnfollow disabled -> follow tag survives
+const pr2 = Core.pruneSources(pstate2, new Set(), new Set(), { delOnUnfollow: false, delOnUnsubscribe: true });
+assertEq(pstate2.videos.fs.sources, ['follow'], 'season tag removed, follow tag kept (setting off)');
+assertEq(pstate2.seasons['11'], undefined, 'season entry removed regardless');
+
 // ---- summary ----
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

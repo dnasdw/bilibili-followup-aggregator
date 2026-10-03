@@ -2,7 +2,7 @@
 // @name         B站关注动态聚合器 - 视频补课与增量归档
 // @name:en      Bilibili Follow Feed Aggregator - Video Backfill & Incremental Archive
 // @namespace    https://github.com/dnasdw
-// @version      1.7.0
+// @version      2.0.0
 // @description  聚合全部关注UP主的视频动态（正式投稿+动态视频），按发布时间重建完整时间线。绕过B站关注动态页只能回看约75天历史的限制：支持从任意日期回溯补课（可扫到每个UP的第一条动态）、增量归档、断点续扫、新关注UP自动补全、多设备迁移
 // @description:en  Aggregate video dynamics (uploads + dynamic videos) from all followed creators into one timeline. Bypasses bilibili's ~75-day follow-feed history limit: backfill from any date (down to each creator's very first post), incremental updates, resumable scans, auto-backfill for newly followed creators, JSON export/import for migration.
 // @author       dnasdw
@@ -52,6 +52,9 @@
         nav: 'https://api.bilibili.com/x/web-interface/nav',
         followings: (mid, pn) => `https://api.bilibili.com/x/relation/followings?vmid=${mid}&pn=${pn}&ps=50&order=desc`,
         feedSpace: (mid, offset) => `https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space?host_mid=${mid}&offset=${encodeURIComponent(offset)}&platform=web&features=itemOpusStyle`,
+        feedPgc: (offset) => `https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all?type=pgc&offset=${encodeURIComponent(offset)}&platform=web&features=itemOpusStyle`,
+        collectedList: (mid, pn) => `https://api.bilibili.com/x/v3/fav/folder/collected/list?up_mid=${mid}&pn=${pn}&ps=20`,
+        seasonArchives: (mid, seasonId, pn) => `https://api.bilibili.com/x/polymer/web-space/seasons_archives_list?mid=${mid}&season_id=${seasonId}&page_num=${pn}&page_size=30&sort_reverse=false`,
     };
 
     // ============================ Pure core (testable, no DOM / no GM) ============================
@@ -121,6 +124,7 @@
                     badge: (arc.badge && arc.badge.text) || '',
                     cover: String(arc.cover || '').replace(/^http:\/\//, 'https://'),
                     url: 'https://www.bilibili.com/video/' + arc.bvid,
+                    sources: ['follow'],
                 });
             }
 
@@ -140,8 +144,9 @@
             return false;
         },
 
-        /** Merge videos into a bvid-keyed map. New bvids are added; existing
-         *  entries get missing fields (cover) backfilled from newer scans. */
+        /** Merge videos into an id-keyed map. New ids are added; existing entries
+         *  get missing fields backfilled and sources unioned (a video can be both
+         *  an upload dynamic from a followed UP and an episode of a subscribed season). */
         mergeVideos(map, videos) {
             let added = 0;
             for (const v of videos) {
@@ -150,6 +155,9 @@
                 else {
                     if (!ex.cover && v.cover) ex.cover = v.cover;
                     if (!ex.badge && v.badge) ex.badge = v.badge;
+                    for (const s of v.sources || []) {
+                        if (ex.sources.indexOf(s) === -1) ex.sources.push(s);
+                    }
                 }
             }
             return added;
@@ -201,6 +209,194 @@
         },
 
         /**
+         * Parse one feed/all?type=pgc page (bangumi/drama updates from the follow
+         * feed; subject to the ~75-day window inherent to that feed).
+         * PGC items have no bvid - a stable pseudo id "ep{epid}" is used so they
+         * fit the same dedup/table machinery as regular videos.
+         * Returns { videos, ups, oldestTs, hasMore, offset }.
+         */
+        parsePgcPage(json, sinceTs) {
+            const data = (json && json.data) || {};
+            const items = data.items || [];
+            const videos = [];
+            const ups = {};
+            let oldestTs = Infinity;
+
+            for (const item of items) {
+                const mods = item.modules || {};
+                const author = mods.module_author || {};
+                const major = (mods.module_dynamic || {}).major;
+                const ts = Number(author.pub_ts) || 0;
+                if (ts && ts < oldestTs) oldestTs = ts;
+
+                if (item.type !== 'DYNAMIC_TYPE_PGC') continue;
+                const pgc = major && major.pgc;
+                if (!pgc || ts < sinceTs) continue;
+
+                const epid = Number(pgc.epid) || 0;
+                if (!epid) continue;
+                const upMid = String(author.mid || '');
+                if (upMid && !ups[upMid]) {
+                    ups[upMid] = {
+                        name: author.name || '',
+                        face: String(author.face || '').replace(/^http:\/\//, 'https://'),
+                    };
+                }
+                const isDrama = Number(pgc.season_type) === 5; // 5 = tv drama; 1 anime, 4 guochuang ...
+                videos.push({
+                    bvid: 'ep' + epid,
+                    title: `${pgc.title || ''} ${pgc.sub_title || ''}`.trim() || '(剧集更新)',
+                    pubTs: ts,
+                    upMid,
+                    duration: '',
+                    badge: isDrama ? '追剧' : '追番',
+                    cover: String(pgc.cover || '').replace(/^http:\/\//, 'https://'),
+                    url: String(pgc.url || '').replace(/^\/\//, 'https://') || ('https://www.bilibili.com/bangumi/play/ep' + epid),
+                    sources: ['pgc'],
+                });
+            }
+
+            return {
+                videos,
+                ups,
+                oldestTs: oldestTs === Infinity ? 0 : oldestTs,
+                hasMore: Boolean(data.has_more),
+                offset: typeof data.offset === 'string' ? data.offset : '',
+            };
+        },
+
+        /**
+         * Parse one seasons_archives_list page (episodes of a subscribed collection).
+         * Returns { videos, ups, meta, hasMore, pageNum } - meta carries season info.
+         */
+        parseSeasonPage(json, sinceTs) {
+            const data = (json && json.data) || {};
+            const archives = data.archives || [];
+            const meta = data.meta || {};
+            const seasonMid = String(meta.mid || '');
+            const videos = [];
+
+            for (const arc of archives) {
+                const ts = Number(arc.pubdate) || Number(arc.ctime) || 0;
+                if (!arc.bvid || !ts || ts < sinceTs) continue;
+                videos.push({
+                    bvid: String(arc.bvid),
+                    title: arc.title || '(无标题)',
+                    pubTs: ts,
+                    upMid: seasonMid,
+                    duration: Core.fmtDuration(Number(arc.duration) || 0),
+                    badge: '合集',
+                    cover: String(arc.pic || '').replace(/^http:\/\//, 'https://'),
+                    url: 'https://www.bilibili.com/video/' + arc.bvid,
+                    seasonId: String(meta.season_id || ''),
+                    sources: ['season'],
+                });
+            }
+
+            const page = data.page || {};
+            const pageNum = Number(page.page_num) || 1;
+            const total = Number(page.total) || 0;
+            return {
+                videos,
+                meta: {
+                    seasonId: String(meta.season_id || ''),
+                    mid: seasonMid,
+                    name: meta.name || '',
+                    cover: String(meta.cover || '').replace(/^http:\/\//, 'https://'),
+                    total,
+                },
+                hasMore: pageNum * 30 < total,
+                pageNum,
+            };
+        },
+
+        /** Parse collected/list page ("我追的合集/收藏夹").
+         *  Entries mixing folders and seasons - both are returned as candidates;
+         *  the scanner probes each with seasons_archives_list and skips non-seasons. */
+        parseCollectedList(json) {
+            const data = (json && json.data) || {};
+            const list = data.list || [];
+            return {
+                total: Number(data.count) || list.length,
+                list: list.map((it) => ({
+                    id: String(it.season_id || it.id || ''),
+                    title: it.title || '',
+                    mid: String(it.mid || ''),
+                    mediaCount: Number(it.media_count) || 0,
+                })).filter((it) => it.id),
+            };
+        },
+
+        fmtDuration(seconds) {
+            const s = Math.max(0, Math.floor(Number(seconds) || 0));
+            const m = Math.floor(s / 60);
+            const h = Math.floor(m / 60);
+            const p = (n) => String(n).padStart(2, '0');
+            return h > 0 ? `${h}:${p(m % 60)}:${p(s % 60)}` : `${m}:${p(s % 60)}`;
+        },
+
+        /** Tab filter: tabs are driven by the sources array of each entry. */
+        filterByTab(list, tab) {
+            if (tab === 'all') return list;
+            return list.filter((v) => (v.sources || []).indexOf(tab) !== -1);
+        },
+
+        /**
+         * Handle unfollowed UPs / unsubscribed seasons: remove the matching source
+         * tag (the entry disappears from that tab); delete the record entirely only
+         * when no source tag remains. The two settings gate their respective tags.
+         * Returns { removedVideos, untagged } for logging.
+         */
+        pruneSources(state, liveFollows, liveSeasons, settings) {
+            let removedVideos = 0;
+            let untagged = 0;
+            const unfollow = settings.delOnUnfollow !== false;
+            const unsub = settings.delOnUnsubscribe !== false;
+
+            if (unfollow) {
+                for (const v of Object.values(state.videos)) {
+                    const i = (v.sources || []).indexOf('follow');
+                    if (i !== -1 && !liveFollows.has(v.upMid)) {
+                        v.sources.splice(i, 1);
+                        untagged++;
+                        if (!v.sources.length) { delete state.videos[v.bvid]; removedVideos++; }
+                    }
+                }
+                for (const mid of Object.keys(state.ups)) {
+                    if (!liveFollows.has(mid)) state.ups[mid].lastTs = 0; // re-follow -> full backfill
+                }
+            }
+            if (unsub) {
+                for (const v of Object.values(state.videos)) {
+                    if (!state.videos[v.bvid]) continue; // may have been deleted above
+                    const i = (v.sources || []).indexOf('season');
+                    if (i !== -1 && !liveSeasons.has(String(v.seasonId || ''))) {
+                        v.sources.splice(i, 1);
+                        untagged++;
+                        if (!v.sources.length) { delete state.videos[v.bvid]; removedVideos++; }
+                    }
+                }
+                for (const sid of Object.keys(state.seasons || {})) {
+                    if (!liveSeasons.has(sid)) delete state.seasons[sid];
+                }
+            }
+            return { removedVideos, untagged };
+        },
+
+        /** Migrate v2 state (no sources/seasons/settings) to v3. */
+        migrateV2ToV3(state) {
+            for (const v of Object.values(state.videos || {})) {
+                if (!Array.isArray(v.sources)) v.sources = ['follow'];
+            }
+            if (!state.seasons || typeof state.seasons !== 'object') state.seasons = {};
+            if (!state.settings || typeof state.settings !== 'object') {
+                state.settings = { defaultTab: 'all', delOnUnsubscribe: true, delOnUnfollow: true };
+            }
+            state.version = 3;
+            return state;
+        },
+
+        /**
          * Rebuild videos-map + ups-table from an exported video array
          * (strips the redundant upName/face rows back into the per-UP table).
          */
@@ -210,6 +406,7 @@
             for (const v of list || []) {
                 if (!v || !v.bvid || !v.pubTs) continue;
                 const { upName, face, ...rest } = v;
+                if (!Array.isArray(rest.sources) || !rest.sources.length) rest.sources = ['follow']; // legacy export
                 videos[v.bvid] = rest;
                 if (v.upMid) {
                     const ex = ups[v.upMid];
@@ -383,7 +580,12 @@
 
     const Store = {
         load() {
-            const fresh = () => ({ version: 2, videos: {}, ups: {}, lastScanTs: 0, scan: null });
+            const fresh = () => ({
+                version: 3,
+                videos: {}, ups: {}, seasons: {},
+                settings: { defaultTab: 'all', delOnUnsubscribe: true, delOnUnfollow: true },
+                lastScanTs: 0, globalFloorTs: 0, scan: null,
+            });
             let raw = null;
             try { raw = GM_getValue(CONFIG.storageKey, null); } catch (e) { return fresh(); }
             if (!raw) return fresh();
@@ -392,10 +594,17 @@
             if (!state || typeof state.videos !== 'object') return fresh();
             if (state.version === 1) {
                 state = Core.migrateV1ToV2(state); // dedupe per-video face/upName into an ups table
-                try { GM_setValue(CONFIG.storageKey, JSON.stringify(state)); } catch (e) { /* persist next save */ }
             }
-            if (state.version !== 2) return fresh();
+            if (state.version === 2) {
+                state = Core.migrateV2ToV3(state); // add sources/seasons/settings
+            }
+            if (state.version !== 3) return fresh();
+            try { GM_setValue(CONFIG.storageKey, JSON.stringify(state)); } catch (e) { /* persist next save */ }
             if (!state.ups || typeof state.ups !== 'object') state.ups = {};
+            if (!state.seasons || typeof state.seasons !== 'object') state.seasons = {};
+            if (!state.settings || typeof state.settings !== 'object') {
+                state.settings = { defaultTab: 'all', delOnUnsubscribe: true, delOnUnfollow: true };
+            }
             if (typeof state.globalFloorTs !== 'number' || !state.globalFloorTs) {
                 // 0 = "backfill new UPs to their very first dynamic" (scan-to-bottom)
                 state.globalFloorTs = 0;
@@ -467,10 +676,47 @@
 
     function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
+    /**
+     * Background-tab timer throttling fix: browsers throttle setTimeout in
+     * background tabs down to ~once per minute, which paused scans when the
+     * user switched tabs. A dedicated Web Worker's timers are NOT throttled,
+     * so we race worker timing against a (throttled) setTimeout fallback.
+     * Falls back silently to plain setTimeout when workers are blocked by CSP.
+     */
+    const Sleeper = {
+        worker: null,
+        token: 0,
+        init() {
+            try {
+                const src = 'onmessage=function(e){setTimeout(function(){postMessage(e.data)},e.data.ms)}';
+                this.worker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+            } catch (e) { this.worker = null; }
+        },
+        sleep(ms) {
+            return new Promise((resolve) => {
+                const token = ++this.token;
+                let done = false;
+                const fin = () => {
+                    if (done) return;
+                    done = true;
+                    if (this.worker) this.worker.onmessage = null;
+                    clearTimeout(timer);
+                    resolve();
+                };
+                // fallback timer fires a bit late on purpose (worker should win)
+                const timer = setTimeout(fin, ms + 3000);
+                if (this.worker) {
+                    this.worker.onmessage = (e) => { if (e.data === token) fin(); };
+                    this.worker.postMessage({ ms, data: token });
+                }
+            });
+        },
+    };
+
     async function throttle() {
         const now = Date.now();
         const wait = lastRequestAt + CONFIG.reqDelayMinMs + Math.random() * (CONFIG.reqDelayMaxMs - CONFIG.reqDelayMinMs) - now;
-        if (wait > 0) await sleep(wait);
+        if (wait > 0) await Sleeper.sleep(wait);
         lastRequestAt = Date.now();
     }
 
@@ -560,7 +806,7 @@
                 ? CONFIG.riskBackoffBaseMs * Math.pow(2, attempt) + Math.random() * 2000
                 : CONFIG.retryBaseMs * Math.pow(2, attempt) + Math.random() * 1000;
             UI.log(`${name} 请求失败(${lastErr ? lastErr.message : 'unknown'})，${isRisk ? '疑似风控，' : ''}${Math.round(backoff / 1000)}s 后重试 (${attempt + 1}/${CONFIG.maxRetries})`, 'warn');
-            await sleep(backoff);
+            await Sleeper.sleep(backoff);
         }
         throw lastErr || new ApiError(-4, '请求失败');
     }
@@ -584,6 +830,28 @@
             return all;
         },
 
+        /** Enumerate "我追的" entries, probing each to keep only ugc seasons (folders are skipped). */
+        async getCollectedSeasons(myMid) {
+            const seasons = [];
+            let pn = 1;
+            for (;;) {
+                const json = await apiGet(API.collectedList(myMid, pn), 'https://space.bilibili.com/');
+                const page = Core.parseCollectedList(json);
+                for (const it of page.list) {
+                    try {
+                        const probe = await apiGet(API.seasonArchives(it.mid || myMid, it.id, 1), `https://space.bilibili.com/`);
+                        const meta = (probe.data && probe.data.meta) || {};
+                        if (String(meta.season_id) === it.id) {
+                            seasons.push({ seasonId: it.id, title: meta.name || it.title, mid: String(meta.mid || it.mid || '') });
+                        }
+                    } catch (e) { /* entry is a fav folder or request failed - skip */ }
+                }
+                if (seasons.length >= page.total || !page.list.length || pn >= 20) break;
+                pn++;
+            }
+            return seasons;
+        },
+
         /** Mark a UP as scanned just now (its incremental floor for next time). */
         setLastScanTs(state, mid, ts) {
             if (!state.ups[mid]) state.ups[mid] = { mid, name: '', face: '' };
@@ -603,7 +871,7 @@
                 // inner progress: show which time point we have paged back to,
                 // so a long scan through a prolific UP never looks stuck
                 if (page.oldestTs > 0) {
-                    UI.progressSub(`${up.uname} · 第${i + 1}页 · 已扫到 ${Core.fmtDateTime(page.oldestTs)} · 累计+${found}`);
+                    UI.progressSub(`${up.name} · 第${i + 1}页 · 已扫到 ${Core.fmtDateTime(page.oldestTs)} · 累计+${found}`);
                 }
                 if (Core.shouldStopPaging(page, sinceTs)) {
                     this.setLastScanTs(state, up.mid, t0);
@@ -612,6 +880,47 @@
                 offset = page.offset;
             }
             this.setLastScanTs(state, up.mid, t0); // safety cap reached, coverage is still contiguous
+            return found;
+        },
+
+        /** Scan one subscribed season: page through all episodes, filter by sinceTs. */
+        async scanSeason(entry, sinceTs, state) {
+            const t0 = Math.floor(Date.now() / 1000);
+            let found = 0;
+            let title = entry.name;
+            for (let pn = 1; pn <= 100; pn++) {
+                const json = await apiGet(API.seasonArchives(entry.mid, entry.seasonId, pn), 'https://space.bilibili.com/');
+                const page = Core.parseSeasonPage(json, sinceTs);
+                found += Core.mergeVideos(state.videos, page.videos);
+                if (page.meta.seasonId) {
+                    const s = state.seasons[page.meta.seasonId] = state.seasons[page.meta.seasonId]
+                        || { seasonId: page.meta.seasonId, mid: page.meta.mid, title: page.meta.name, lastTs: 0 };
+                    if (page.meta.name) { s.title = page.meta.name; if (!title) title = page.meta.name; }
+                    if (page.meta.mid) Core.mergeUps(state.ups, { [page.meta.mid]: { name: '', face: page.meta.cover } });
+                }
+                UI.progressSub(`${title || entry.seasonId} · 第${pn}页 · 累计+${found}`);
+                if (!page.hasMore) break;
+            }
+            if (state.seasons[entry.seasonId]) state.seasons[entry.seasonId].lastTs = t0;
+            else state.seasons[entry.seasonId] = { seasonId: entry.seasonId, mid: entry.mid, title, lastTs: t0 };
+            return found;
+        },
+
+        /** Scan bangumi/drama updates from the follow feed (type=pgc, ~75-day window). */
+        async scanPgc(sinceTs, state) {
+            let offset = '';
+            let found = 0;
+            for (let i = 0; i < 30; i++) {
+                const json = await apiGet(API.feedPgc(offset), 'https://t.bilibili.com/');
+                const page = Core.parsePgcPage(json, sinceTs);
+                found += Core.mergeVideos(state.videos, page.videos);
+                Core.mergeUps(state.ups, page.ups);
+                if (page.oldestTs > 0) {
+                    UI.progressSub(`追番追剧 · 第${i + 1}页 · 已扫到 ${Core.fmtDateTime(page.oldestTs)} · 累计+${found}`);
+                }
+                if (Core.shouldStopPaging(page, sinceTs)) return found;
+                offset = page.offset;
+            }
             return found;
         },
 
@@ -651,44 +960,76 @@
                     if (!(nav.data && nav.data.isLogin)) throw new ApiError(-101, 'B站账号未登录');
                     const myMid = nav.data.mid;
                     const followings = await this.getFollowings(myMid);
+                    UI.log('正在枚举"我追的"订阅合集...');
+                    const collectedSeasons = await this.getCollectedSeasons(myMid);
+
+                    if (mode === 'increment') {
+                        // apply unfollow/unsubscribe cleanup according to settings
+                        const liveFollows = new Set(followings.map((u) => u.mid));
+                        const liveSeasons = new Set(collectedSeasons.map((s) => s.seasonId));
+                        const pr = Core.pruneSources(state, liveFollows, liveSeasons, state.settings);
+                        if (pr.removedVideos || pr.untagged) {
+                            UI.log(`取关/退订清理：删除 ${pr.removedVideos} 条记录，${pr.untagged} 条移出对应分类`);
+                        }
+                    }
+
                     state.scan = {
                         sinceTs,
                         startedAt: Math.floor(Date.now() / 1000),
-                        queue: followings,
+                        queue: [
+                            ...followings.map((u) => ({ kind: 'up', mid: u.mid, name: u.uname })),
+                            ...collectedSeasons.map((s) => ({ kind: 'season', seasonId: s.seasonId, mid: s.mid, name: s.title })),
+                        ],
                         done: 0,
                         errors: [],
                         mode,
                     };
                     Store.save(state);
                     if (mode === 'full') {
-                        UI.log(`共 ${followings.length} 个关注，起始日期 ${Core.fmtDate(sinceTs)}`);
+                        UI.log(`共 ${followings.length} 个关注 + ${collectedSeasons.length} 个订阅合集，起始日期 ${Core.fmtDate(sinceTs)}`);
                     } else {
-                        const floorInfo = state.globalFloorTs
-                            ? `（新关注的UP将自动补全至 ${Core.fmtDate(state.globalFloorTs)}）`
-                            : '（新关注的UP将自动扫描其全部历史动态）';
-                        UI.log(`共 ${followings.length} 个关注，增量更新${floorInfo}`);
+                        UI.log(`共 ${followings.length} 个关注 + ${collectedSeasons.length} 个订阅合集，增量更新（新关注/新订阅将自动补全历史）`);
                     }
                 }
 
                 const scan = state.scan;
                 while (scan.queue.length > 0) {
                     if (this.stopFlag) { UI.log('扫描已暂停，可稍后"继续未完成的扫描"', 'warn'); Store.save(state); return; }
-                    const up = scan.queue[0];
-                    UI.progress(scan.done, scan.done + scan.queue.length, up.uname);
-                    const upSince = (scan.mode === 'increment')
-                        ? Core.incSinceTs(state.ups[up.mid], state.globalFloorTs, state.lastScanTs)
-                        : sinceTs;
+                    const entry = scan.queue[0];
+                    UI.progress(scan.done, scan.done + scan.queue.length, entry.name || entry.mid);
                     try {
-                        const found = await this.scanUp(up, upSince, state);
-                        UI.log(`${up.uname}: +${found} 条视频`);
+                        let found = 0;
+                        if (entry.kind === 'season') {
+                            const seasonSince = (scan.mode === 'increment')
+                                ? ((state.seasons[entry.seasonId] && state.seasons[entry.seasonId].lastTs) || state.globalFloorTs)
+                                : sinceTs;
+                            found = await this.scanSeason(entry, seasonSince, state);
+                        } else {
+                            const upSince = (scan.mode === 'increment')
+                                ? Core.incSinceTs(state.ups[entry.mid], state.globalFloorTs, state.lastScanTs)
+                                : sinceTs;
+                            found = await this.scanUp(entry, upSince, state);
+                        }
+                        UI.log(`${entry.name || entry.mid}: +${found} 条`);
                     } catch (e) {
                         if (e.code === -101 || e.code === -100) throw e; // fatal: not logged in / user stopped
-                        scan.errors.push({ mid: up.mid, uname: up.uname, msg: e.message });
-                        UI.log(`${up.uname}: 失败 ${e.message}`, 'error');
+                        scan.errors.push({ mid: entry.mid || entry.seasonId, uname: entry.name || '', msg: e.message });
+                        UI.log(`${entry.name || entry.mid}: 失败 ${e.message}`, 'error');
                     }
                     scan.queue.shift();
                     scan.done++;
-                    Store.save(state); // persist after every UP for resumability
+                    Store.save(state); // persist after every entry for resumability
+                }
+
+                // bangumi/drama updates via the follow feed (~75-day window)
+                try {
+                    const pgcSince = (scan.mode === 'increment') ? (state.lastScanTs || 0) : sinceTs;
+                    const pgcFound = await this.scanPgc(pgcSince, state);
+                    UI.log(`追番追剧: +${pgcFound} 条`);
+                } catch (e) {
+                    if (e.code === -101 || e.code === -100) throw e;
+                    scan.errors.push({ mid: 'pgc', uname: '追番追剧', msg: e.message });
+                    UI.log(`追番追剧: 失败 ${e.message}`, 'error');
                 }
 
                 state.lastScanTs = scan.startedAt;
@@ -742,7 +1083,16 @@
 #bfua-log{background:#f6f7f8;border-radius:6px;padding:8px;height:110px;overflow-y:auto;font-size:12px;line-height:1.7;font-family:Consolas,monospace;white-space:pre-wrap;word-break:break-all}
 .bfua-log-warn{color:#b88100}
 .bfua-log-error{color:#e0533d}
-#bfua-list{border-top:1px solid #e3e5e7;margin-top:10px;height:48vh;overflow-y:auto}
+#bfua-list{border-top:1px solid #e3e5e7;margin-top:6px;height:46vh;overflow-y:auto}
+#bfua-tabs{display:flex;gap:4px;margin-top:10px;flex-wrap:nowrap;overflow-x:auto}
+.bfua-tab{border:1px solid #e3e5e7;background:#fff;color:#61666d;border-radius:6px;padding:4px 12px;cursor:pointer;font-size:12.5px;flex:0 0 auto}
+.bfua-tab:hover{background:#f6f7f8}
+.bfua-tab.active{background:#fb7299;border-color:#fb7299;color:#fff}
+#bfua-settings-overlay{position:fixed;inset:0;z-index:999995;background:rgba(0,0,0,.4);display:none;align-items:center;justify-content:center}
+#bfua-settings-overlay.open{display:flex}
+#bfua-settings-card{background:#fff;color:#18191c;border-radius:12px;box-shadow:0 4px 24px rgba(0,0,0,.3);width:380px;max-width:calc(100vw - 32px);padding:16px;font-size:13px}
+#bfua-settings-card label{display:flex;align-items:center;gap:8px;margin:12px 0;cursor:pointer}
+#bfua-settings-card select{border:1px solid #e3e5e7;border-radius:6px;padding:4px 6px;font-size:13px;background:#fff;color:#18191c}
 .bfua-item{display:flex;gap:10px;padding:8px 4px;border-bottom:1px solid #f1f2f3;color:inherit;text-decoration:none;line-height:1.45}
 .bfua-item:hover{background:#f6f7f8}
 .bfua-cover{flex:0 0 152px;width:152px;height:95px;border-radius:6px;object-fit:cover;background:#e3e5e7}
@@ -807,14 +1157,38 @@
 <div class="bfua-row">
   <button class="bfua-btn" id="bfua-export">导出 JSON</button>
   <button class="bfua-btn" id="bfua-import">导入 JSON</button>
+  <button class="bfua-btn" id="bfua-settings">⚙ 设置</button>
   <button class="bfua-btn danger" id="bfua-clear">清空数据</button>
   <input type="file" id="bfua-import-file" accept=".json,application/json" style="display:none">
 </div>
+<div id="bfua-tabs"></div>
 <div id="bfua-list"></div>
 <div id="bfua-pager"></div>
 `;
             document.body.appendChild(fab);
             document.body.appendChild(panel);
+
+            const overlay = document.createElement('div');
+            overlay.id = 'bfua-settings-overlay';
+            overlay.innerHTML = `
+<div id="bfua-settings-card">
+  <b>⚙ 设置</b>
+  <button class="bfua-btn" id="bfua-settings-close" style="float:right;padding:2px 8px">×</button>
+  <label>默认分类标签页
+    <select id="bfua-set-default-tab">
+      <option value="all">全部视频</option>
+      <option value="follow">视频投稿</option>
+      <option value="pgc">追番追剧</option>
+      <option value="season">订阅合集</option>
+    </select>
+  </label>
+  <label><input type="checkbox" id="bfua-set-del-unsub"> 取消订阅合集时移除对应记录</label>
+  <label><input type="checkbox" id="bfua-set-del-unfollow"> 取消关注UP主时移除对应记录</label>
+  <div style="color:#9499a0;font-size:12px;line-height:1.6;margin:8px 0">说明：交叉来源的视频（既是UP动态又在订阅合集中）只会移出对应分类页，所有来源都移除后才删除本地记录。</div>
+  <button class="bfua-btn primary" id="bfua-settings-save" style="width:100%">保存</button>
+</div>
+`;
+            document.body.appendChild(overlay);
 
             this.els = {
                 fab, panel,
@@ -835,11 +1209,19 @@
                 importBtn: panel.querySelector('#bfua-import'),
                 importFile: panel.querySelector('#bfua-import-file'),
                 clearBtn: panel.querySelector('#bfua-clear'),
+                tabs: panel.querySelector('#bfua-tabs'),
+                settingsBtn: panel.querySelector('#bfua-settings'),
+                settingsOverlay: overlay,
+                settingsClose: overlay.querySelector('#bfua-settings-close'),
+                settingsSave: overlay.querySelector('#bfua-settings-save'),
+                setDefaultTab: overlay.querySelector('#bfua-set-default-tab'),
+                setDelUnsub: overlay.querySelector('#bfua-set-del-unsub'),
+                setDelUnfollow: overlay.querySelector('#bfua-set-del-unfollow'),
             };
 
             fab.addEventListener('click', () => {
                 const isOpen = panel.classList.toggle('open');
-                if (isOpen) { this.renderStats(); this.renderList(this.loadPage()); this.updateButtons(); }
+                if (isOpen) { this.renderTabs(); this.renderStats(); this.renderList(this.loadPage()); this.updateButtons(); }
             });
             // quick paging with arrow keys while the panel is open
             document.addEventListener('keydown', (e) => {
@@ -858,6 +1240,29 @@
             });            this.els.resume.addEventListener('click', () => ScanEngine.run('resume'));
             this.els.stop.addEventListener('click', () => ScanEngine.stop());
             this.els.exportBtn.addEventListener('click', () => this.exportJson());
+            this.els.settingsBtn.addEventListener('click', () => {
+                const s = Store.load().settings;
+                this.els.setDefaultTab.value = s.defaultTab || 'all';
+                this.els.setDelUnsub.checked = s.delOnUnsubscribe !== false;
+                this.els.setDelUnfollow.checked = s.delOnUnfollow !== false;
+                this.els.settingsOverlay.classList.add('open');
+            });
+            this.els.settingsClose.addEventListener('click', () => this.els.settingsOverlay.classList.remove('open'));
+            this.els.settingsOverlay.addEventListener('click', (e) => {
+                if (e.target === this.els.settingsOverlay) this.els.settingsOverlay.classList.remove('open');
+            });
+            this.els.settingsSave.addEventListener('click', () => {
+                const state = Store.load();
+                state.settings = {
+                    defaultTab: this.els.setDefaultTab.value,
+                    delOnUnsubscribe: this.els.setDelUnsub.checked,
+                    delOnUnfollow: this.els.setDelUnfollow.checked,
+                };
+                Store.save(state);
+                this.els.settingsOverlay.classList.remove('open');
+                this.log('设置已保存');
+                this.renderTabs();
+            });
             this.els.importBtn.addEventListener('click', () => {
                 if (ScanEngine.running) { this.log('扫描进行中，请先停止再导入', 'warn'); return; }                this.els.importFile.value = '';
                 this.els.importFile.click();
@@ -871,7 +1276,11 @@
                 if (!confirm('确定清空全部已聚合的视频数据？')) return;
                 Store.clear();
                 this.anchorBvid = null;
-                this.savePage(1);
+                for (const t of this.TABS) {
+                    try { localStorage.removeItem('bfua_page_' + t.id); } catch (e) { /* ignore */ }
+                }
+                try { localStorage.removeItem('bfua_tab'); } catch (e) { /* ignore */ }
+                this.currentTab = null;
                 this.renderStats();
                 this.renderList(1);
                 this.log('数据已清空');
@@ -930,9 +1339,11 @@
         renderStats() {
             const state = Store.load();
             const n = Object.keys(state.videos).length;
-            const parts = [`库中 ${n} 条视频`];
+            const nSeasons = Object.keys(state.seasons || {}).length;
+            const parts = [`库中 ${n} 条`];
+            if (nSeasons) parts.push(`${nSeasons} 个订阅合集`);
             if (state.lastScanTs) parts.push(`上次扫描 ${Core.fmtDateTime(state.lastScanTs)}`);
-            if (state.scan) parts.push(`未完成：剩余 ${state.scan.queue.length} 个UP`);
+            if (state.scan) parts.push(`未完成：剩余 ${state.scan.queue.length} 项`);
             if (state.scan && state.scan.errors && state.scan.errors.length) parts.push(`错误 ${state.scan.errors.length} 个`);
             this.els.stats.textContent = parts.join(' · ');
             this.updateButtons();
@@ -940,6 +1351,44 @@
 
         currentPage: 1,
         anchorBvid: null, // in-memory only (never persisted): first visible item when a scan starts
+
+        TABS: [
+            { id: 'all', label: '全部视频' },
+            { id: 'follow', label: '视频投稿' },
+            { id: 'pgc', label: '追番追剧' },
+            { id: 'season', label: '订阅合集' },
+        ],
+
+        currentTab: null,
+
+        saveTab(tab) {
+            try { localStorage.setItem('bfua_tab', tab); } catch (e) { /* ignore */ }
+        },
+        loadTab() {
+            const state = Store.load();
+            let tab = null;
+            try { tab = localStorage.getItem('bfua_tab'); } catch (e) { /* ignore */ }
+            if (!tab || this.TABS.every((t) => t.id !== tab)) tab = (state.settings && state.settings.defaultTab) || 'all';
+            return tab;
+        },
+
+        renderTabs() {
+            if (!this.currentTab) this.currentTab = this.loadTab();
+            const tab = this.currentTab;
+            this.els.tabs.innerHTML = '';
+            for (const t of this.TABS) {
+                const b = document.createElement('button');
+                b.className = 'bfua-tab' + (t.id === tab ? ' active' : '');
+                b.textContent = t.label;
+                b.addEventListener('click', () => {
+                    this.currentTab = t.id;
+                    this.saveTab(t.id);
+                    this.renderTabs();
+                    this.renderList(1);
+                });
+                this.els.tabs.appendChild(b);
+            }
+        },
 
         /**
          * Capture the first visible item of the currently viewed page as the
@@ -949,7 +1398,7 @@
         captureAnchor() {
             this.anchorBvid = null;
             const state = Store.load();
-            const list = Core.sortedList(state.videos);
+            const list = Core.filterByTab(Core.sortedList(state.videos), this.currentTab || this.loadTab());
             if (!list.length) return;
             const pages = Math.ceil(list.length / CONFIG.listPageSize);
             const page = Math.min(this.loadPage() || 1, pages);
@@ -960,22 +1409,22 @@
         /** Re-render the list positioned so the anchor video is still visible. */
         renderListAnchored() {
             const state = Store.load();
-            const list = Core.sortedList(state.videos);
+            const list = Core.filterByTab(Core.sortedList(state.videos), this.currentTab || this.loadTab());
             this.renderList(Core.pageForAnchor(list, this.anchorBvid, CONFIG.listPageSize));
         },
 
-        /** persist current page in localStorage (separate from GM scan state to avoid write races) */
+        /** persist current page (per-tab) in localStorage (separate from GM scan state to avoid write races) */
         savePage(page) {
-            try { localStorage.setItem('bfua_page', String(page)); } catch (e) { /* ignore */ }
+            try { localStorage.setItem('bfua_page_' + (this.currentTab || 'all'), String(page)); } catch (e) { /* ignore */ }
         },
         loadPage() {
-            const n = parseInt(localStorage.getItem('bfua_page') || '1', 10);
+            const n = parseInt(localStorage.getItem('bfua_page_' + (this.currentTab || 'all')) || '1', 10);
             return Number.isFinite(n) && n >= 1 ? n : 1;
         },
 
         renderList(page) {
             const state = Store.load();
-            const list = Core.sortedList(state.videos);
+            const list = Core.filterByTab(Core.sortedList(state.videos), this.currentTab || this.loadTab());
             const pages = Math.max(1, Math.ceil(list.length / CONFIG.listPageSize));
             page = Math.min(Math.max(1, page), pages);
             this.currentPage = page;
@@ -1027,7 +1476,7 @@
                         ph.className = 'bfua-face-empty';
                         line1.appendChild(ph);
                     }
-                    const upNameEl = document.createElement('span'); upNameEl.className = 'bfua-up'; upNameEl.textContent = up.name || v.upMid;
+                    const upNameEl = document.createElement('span'); upNameEl.className = 'bfua-up'; upNameEl.textContent = v.seasonName || up.name || v.upMid;
                     line1.appendChild(upNameEl);
                     // highlight non-upload videos only (uploads are the common case -> keep quiet)
                     if (v.badge && v.badge !== '投稿视频') {
@@ -1115,7 +1564,7 @@
                 const built = Core.buildFromVideoList(data.videos);
                 // authoritative per-UP table (with lastTs) comes from the new export
                 // format; legacy exports only carry per-video upName/face
-                const importedUps = (data.format === 'bfua-export-v1' && data.ups && typeof data.ups === 'object')
+                const importedUps = ((data.format === 'bfua-export-v1' || data.format === 'bfua-export-v2') && data.ups && typeof data.ups === 'object')
                     ? data.ups
                     : built.ups;
                 const added = Core.mergeStateForImport(state, {
@@ -1124,8 +1573,20 @@
                     globalFloorTs: Number(data.globalFloorTs) || 0,
                     lastScanTs: Number(data.lastScanTs) || 0,
                 });
+                // v2 export: settings + seasons snapshot (migrating preferences & season progress)
+                if (data.format === 'bfua-export-v2') {
+                    if (data.settings && typeof data.settings === 'object' && !Object.keys(state.settings).length) {
+                        state.settings = data.settings;
+                    }
+                    for (const [sid, info] of Object.entries(data.seasons || {})) {
+                        const ex = state.seasons[sid];
+                        if (!ex) state.seasons[sid] = info;
+                        else if (info.lastTs && (!ex.lastTs || info.lastTs > ex.lastTs)) ex.lastTs = info.lastTs;
+                    }
+                }
                 Store.save(state);
                 this.log(`导入完成：新增 ${added} 条，合计 ${Object.keys(state.videos).length} 条（导入前 ${before} 条）`);
+                this.renderTabs();
                 this.renderStats();
                 this.renderList(this.loadPage());
                 this.updateButtons();
@@ -1142,12 +1603,14 @@
             });
             if (!list.length) { this.log('没有数据可导出', 'warn'); return; }
             const payload = {
-                format: 'bfua-export-v1',
+                format: 'bfua-export-v2',
                 exportedAt: new Date().toISOString(),
                 count: list.length,
                 globalFloorTs: state.globalFloorTs || 0,
                 lastScanTs: state.lastScanTs || 0,
+                settings: state.settings,
                 ups: state.ups,
+                seasons: state.seasons || {},
                 videos: list,
             };
             const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
@@ -1169,6 +1632,7 @@
             return;
         }
         UI.build();
+        Sleeper.init(); // worker-based timer keeps scans running in background tabs
         console.log('[bfua] 关注UP视频聚合器已加载');
     }
 
