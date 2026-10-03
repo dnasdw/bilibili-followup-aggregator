@@ -2,7 +2,7 @@
 // @name         B站关注动态聚合器 - 视频补课与增量归档
 // @name:en      Bilibili Follow Feed Aggregator - Video Backfill & Incremental Archive
 // @namespace    https://github.com/dnasdw
-// @version      2.0.0
+// @version      2.1.0
 // @description  聚合全部关注UP主的视频动态（正式投稿+动态视频），按发布时间重建完整时间线。绕过B站关注动态页只能回看约75天历史的限制：支持从任意日期回溯补课（可扫到每个UP的第一条动态）、增量归档、断点续扫、新关注UP自动补全、多设备迁移
 // @description:en  Aggregate video dynamics (uploads + dynamic videos) from all followed creators into one timeline. Bypasses bilibili's ~75-day follow-feed history limit: backfill from any date (down to each creator's very first post), incremental updates, resumable scans, auto-backfill for newly followed creators, JSON export/import for migration.
 // @author       dnasdw
@@ -55,6 +55,7 @@
         feedPgc: (offset) => `https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all?type=pgc&offset=${encodeURIComponent(offset)}&platform=web&features=itemOpusStyle`,
         collectedList: (mid, pn) => `https://api.bilibili.com/x/v3/fav/folder/collected/list?up_mid=${mid}&pn=${pn}&ps=20`,
         seasonArchives: (mid, seasonId, pn) => `https://api.bilibili.com/x/polymer/web-space/seasons_archives_list?mid=${mid}&season_id=${seasonId}&page_num=${pn}&page_size=30&sort_reverse=false`,
+        bangumiFollow: (mid, type, pn) => `https://api.bilibili.com/x/space/bangumi/follow/list?vmid=${mid}&type=${type}&pn=${pn}&ps=30`,
     };
 
     // ============================ Pure core (testable, no DOM / no GM) ============================
@@ -252,6 +253,7 @@
                     badge: isDrama ? '追剧' : '追番',
                     cover: String(pgc.cover || '').replace(/^http:\/\//, 'https://'),
                     url: String(pgc.url || '').replace(/^\/\//, 'https://') || ('https://www.bilibili.com/bangumi/play/ep' + epid),
+                    seasonId: String(pgc.season_id || ''),
                     sources: ['pgc'],
                 });
             }
@@ -327,6 +329,19 @@
             };
         },
 
+        /** Parse one page of the bangumi follow list (type=1 anime / type=2 drama). */
+        parseBangumiFollowList(json) {
+            const data = (json && json.data) || {};
+            const list = (data.list || [])
+                .map((it) => String(it.season_id || ''))
+                .filter(Boolean);
+            return {
+                list,
+                total: Number(data.total) || list.length,
+                hasNext: Boolean(data.has_next),
+            };
+        },
+
         fmtDuration(seconds) {
             const s = Math.max(0, Math.floor(Number(seconds) || 0));
             const m = Math.floor(s / 60);
@@ -342,16 +357,20 @@
         },
 
         /**
-         * Handle unfollowed UPs / unsubscribed seasons: remove the matching source
-         * tag (the entry disappears from that tab); delete the record entirely only
-         * when no source tag remains. The two settings gate their respective tags.
+         * Handle unfollowed UPs / unsubscribed seasons / unfollowed bangumi:
+         * remove the matching source tag (the entry disappears from that tab);
+         * delete the record entirely only when no source tag remains. The three
+         * settings gate their respective tags. liveBangumi === null means the
+         * list could not be fetched -> skip pgc pruning (never prune blindly).
+         * PGC entries without seasonId (pre-2.1.0 data) are also kept.
          * Returns { removedVideos, untagged } for logging.
          */
-        pruneSources(state, liveFollows, liveSeasons, settings) {
+        pruneSources(state, liveFollows, liveSeasons, liveBangumi, settings) {
             let removedVideos = 0;
             let untagged = 0;
             const unfollow = settings.delOnUnfollow !== false;
             const unsub = settings.delOnUnsubscribe !== false;
+            const unbangumi = settings.delOnUnfollowBangumi !== false;
 
             if (unfollow) {
                 for (const v of Object.values(state.videos)) {
@@ -380,6 +399,17 @@
                     if (!liveSeasons.has(sid)) delete state.seasons[sid];
                 }
             }
+            if (unbangumi && liveBangumi) {
+                for (const v of Object.values(state.videos)) {
+                    if (!state.videos[v.bvid]) continue;
+                    const i = (v.sources || []).indexOf('pgc');
+                    if (i !== -1 && v.seasonId && !liveBangumi.has(v.seasonId)) {
+                        v.sources.splice(i, 1);
+                        untagged++;
+                        if (!v.sources.length) { delete state.videos[v.bvid]; removedVideos++; }
+                    }
+                }
+            }
             return { removedVideos, untagged };
         },
 
@@ -390,7 +420,7 @@
             }
             if (!state.seasons || typeof state.seasons !== 'object') state.seasons = {};
             if (!state.settings || typeof state.settings !== 'object') {
-                state.settings = { defaultTab: 'all', delOnUnsubscribe: true, delOnUnfollow: true };
+                state.settings = { defaultTab: 'all', delOnUnsubscribe: true, delOnUnfollow: true, delOnUnfollowBangumi: true };
             }
             state.version = 3;
             return state;
@@ -583,7 +613,7 @@
             const fresh = () => ({
                 version: 3,
                 videos: {}, ups: {}, seasons: {},
-                settings: { defaultTab: 'all', delOnUnsubscribe: true, delOnUnfollow: true },
+                settings: { defaultTab: 'all', delOnUnsubscribe: true, delOnUnfollow: true, delOnUnfollowBangumi: true },
                 lastScanTs: 0, globalFloorTs: 0, scan: null,
             });
             let raw = null;
@@ -603,8 +633,9 @@
             if (!state.ups || typeof state.ups !== 'object') state.ups = {};
             if (!state.seasons || typeof state.seasons !== 'object') state.seasons = {};
             if (!state.settings || typeof state.settings !== 'object') {
-                state.settings = { defaultTab: 'all', delOnUnsubscribe: true, delOnUnfollow: true };
+                state.settings = { defaultTab: 'all', delOnUnsubscribe: true, delOnUnfollow: true, delOnUnfollowBangumi: true };
             }
+            if (typeof state.settings.delOnUnfollowBangumi !== 'boolean') state.settings.delOnUnfollowBangumi = true;
             if (typeof state.globalFloorTs !== 'number' || !state.globalFloorTs) {
                 // 0 = "backfill new UPs to their very first dynamic" (scan-to-bottom)
                 state.globalFloorTs = 0;
@@ -906,6 +937,28 @@
             return found;
         },
 
+        /** Enumerate the user's bangumi/drama follow list (type 1 + 2 merged).
+         *  Returns a Set of season_ids, or null when the list could not be fetched. */
+        async getBangumiSeasons(myMid) {
+            const seasons = new Set();
+            try {
+                for (const type of [1, 2]) {
+                    let pn = 1;
+                    for (;;) {
+                        const json = await apiGet(API.bangumiFollow(myMid, type, pn), `https://space.bilibili.com/${myMid}/bangumi`);
+                        const page = Core.parseBangumiFollowList(json);
+                        for (const sid of page.list) seasons.add(sid);
+                        if (!page.hasNext || !page.list.length || pn >= 30) break;
+                        pn++;
+                    }
+                }
+                return seasons;
+            } catch (e) {
+                UI.log(`追番追剧列表获取失败(${e.message})，本次跳过对应清理`, 'warn');
+                return null;
+            }
+        },
+
         /** Scan bangumi/drama updates from the follow feed (type=pgc, ~75-day window). */
         async scanPgc(sinceTs, state) {
             let offset = '';
@@ -964,10 +1017,11 @@
                     const collectedSeasons = await this.getCollectedSeasons(myMid);
 
                     if (mode === 'increment') {
-                        // apply unfollow/unsubscribe cleanup according to settings
+                        // apply unfollow/unsubscribe/un-bangumi cleanup according to settings
                         const liveFollows = new Set(followings.map((u) => u.mid));
                         const liveSeasons = new Set(collectedSeasons.map((s) => s.seasonId));
-                        const pr = Core.pruneSources(state, liveFollows, liveSeasons, state.settings);
+                        const liveBangumi = await this.getBangumiSeasons(myMid);
+                        const pr = Core.pruneSources(state, liveFollows, liveSeasons, liveBangumi, state.settings);
                         if (pr.removedVideos || pr.untagged) {
                             UI.log(`取关/退订清理：删除 ${pr.removedVideos} 条记录，${pr.untagged} 条移出对应分类`);
                         }
@@ -1184,6 +1238,7 @@
   </label>
   <label><input type="checkbox" id="bfua-set-del-unsub"> 取消订阅合集时移除对应记录</label>
   <label><input type="checkbox" id="bfua-set-del-unfollow"> 取消关注UP主时移除对应记录</label>
+  <label><input type="checkbox" id="bfua-set-del-bangumi"> 取消追番追剧时移除对应记录</label>
   <div style="color:#9499a0;font-size:12px;line-height:1.6;margin:8px 0">说明：交叉来源的视频（既是UP动态又在订阅合集中）只会移出对应分类页，所有来源都移除后才删除本地记录。</div>
   <button class="bfua-btn primary" id="bfua-settings-save" style="width:100%">保存</button>
 </div>
@@ -1217,6 +1272,7 @@
                 setDefaultTab: overlay.querySelector('#bfua-set-default-tab'),
                 setDelUnsub: overlay.querySelector('#bfua-set-del-unsub'),
                 setDelUnfollow: overlay.querySelector('#bfua-set-del-unfollow'),
+                setDelBangumi: overlay.querySelector('#bfua-set-del-bangumi'),
             };
 
             fab.addEventListener('click', () => {
@@ -1245,6 +1301,7 @@
                 this.els.setDefaultTab.value = s.defaultTab || 'all';
                 this.els.setDelUnsub.checked = s.delOnUnsubscribe !== false;
                 this.els.setDelUnfollow.checked = s.delOnUnfollow !== false;
+                this.els.setDelBangumi.checked = s.delOnUnfollowBangumi !== false;
                 this.els.settingsOverlay.classList.add('open');
             });
             this.els.settingsClose.addEventListener('click', () => this.els.settingsOverlay.classList.remove('open'));
@@ -1257,6 +1314,7 @@
                     defaultTab: this.els.setDefaultTab.value,
                     delOnUnsubscribe: this.els.setDelUnsub.checked,
                     delOnUnfollow: this.els.setDelUnfollow.checked,
+                    delOnUnfollowBangumi: this.els.setDelBangumi.checked,
                 };
                 Store.save(state);
                 this.els.settingsOverlay.classList.remove('open');

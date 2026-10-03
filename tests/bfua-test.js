@@ -377,7 +377,7 @@ const pstate = {
     seasons: { '11': { seasonId: '11', lastTs: 1 }, '22': { seasonId: '22', lastTs: 1 }, '33': { seasonId: '33', lastTs: 1 } },
 };
 // live: only UP 2 and season 11 remain
-const pr1 = Core.pruneSources(pstate, new Set(['2']), new Set(['11']), { delOnUnfollow: true, delOnUnsubscribe: true });
+const pr1 = Core.pruneSources(pstate, new Set(['2']), new Set(['11']), null, { delOnUnfollow: true, delOnUnsubscribe: true, delOnUnfollowBangumi: true });
 assertEq(pstate.videos.fo, undefined, 'follow-only video of unfollowed UP deleted');
 assertEq(pstate.videos.fs.sources, ['season'], 'cross-source video survives via still-subscribed season (removed from follow tab only)');
 assertEq(pstate.videos.fs2, undefined, 'cross-source video deleted after BOTH tags removed');
@@ -394,9 +394,47 @@ const pstate2 = {
     seasons: { '11': { seasonId: '11', lastTs: 1 } },
 };
 // season 11 unsubscribed + UP unfollowed, but delOnUnfollow disabled -> follow tag survives
-const pr2 = Core.pruneSources(pstate2, new Set(), new Set(), { delOnUnfollow: false, delOnUnsubscribe: true });
+const pr2 = Core.pruneSources(pstate2, new Set(), new Set(), null, { delOnUnfollow: false, delOnUnsubscribe: true, delOnUnfollowBangumi: true });
 assertEq(pstate2.videos.fs.sources, ['follow'], 'season tag removed, follow tag kept (setting off)');
 assertEq(pstate2.seasons['11'], undefined, 'season entry removed regardless');
+
+// parseBangumiFollowList
+const bfPage = Core.parseBangumiFollowList({ data: { total: 3, has_next: true, list: [
+    { season_id: 111, title: '番A' }, { season_id: 222, title: '剧B' }, { title: 'broken' },
+] } });
+assertEq(bfPage.list, ['111', '222'], 'season ids stringified, broken filtered');
+assertEq(bfPage.total, 3, 'total passthrough');
+assertEq(bfPage.hasNext, true, 'has_next passthrough');
+
+// parsePgcPage records seasonId (needed for un-bangumi cleanup)
+assertEq(pgcPage.videos[0].seasonId, '777', 'pgc seasonId recorded');
+assertEq(pgcPage.videos[1].seasonId, '778', 'second pgc seasonId');
+
+// pruneSources: pgc dimension (new signature with liveBangumi)
+const pstateB = {
+    videos: {
+        p1: { bvid: 'p1', upMid: '9', seasonId: '111', sources: ['pgc'] },        // still followed
+        p2: { bvid: 'p2', upMid: '9', seasonId: '222', sources: ['pgc'] },        // un-followed -> delete
+        p3: { bvid: 'p3', upMid: '9', seasonId: '', sources: ['pgc'] },           // legacy no seasonId -> keep
+        p4: { bvid: 'p4', upMid: '9', seasonId: '222', sources: ['pgc', 'follow'] }, // cross-source: pgc tag removed, follow kept
+    },
+    ups: {}, seasons: {},
+};
+Core.pruneSources(pstateB, new Set(['9']), new Set(), new Set(['111']), { delOnUnfollow: true, delOnUnsubscribe: true, delOnUnfollowBangumi: true });
+assertEq(pstateB.videos.p1.bvid, 'p1', 'followed bangumi kept');
+assertEq(pstateB.videos.p2, undefined, 'unfollowed bangumi deleted');
+assertEq(pstateB.videos.p3.bvid, 'p3', 'legacy pgc without seasonId never pruned');
+assertEq(pstateB.videos.p4.sources, ['follow'], 'cross-source keeps follow tag');
+
+// null liveBangumi (fetch failed) -> skip pgc pruning entirely
+const pstateC = { videos: { p2: { bvid: 'p2', upMid: '9', seasonId: '222', sources: ['pgc'] } }, ups: {}, seasons: {} };
+Core.pruneSources(pstateC, new Set(['9']), new Set(), null, { delOnUnfollow: true, delOnUnsubscribe: true, delOnUnfollowBangumi: true });
+assertEq(pstateC.videos.p2.bvid, 'p2', 'null bangumi list -> no pgc pruning');
+
+// setting off -> keep pgc tag
+const pstateD = { videos: { p2: { bvid: 'p2', upMid: '9', seasonId: '222', sources: ['pgc'] } }, ups: {}, seasons: {} };
+Core.pruneSources(pstateD, new Set(['9']), new Set(), new Set(['111']), { delOnUnfollow: true, delOnUnsubscribe: true, delOnUnfollowBangumi: false });
+assertEq(pstateD.videos.p2.sources, ['pgc'], 'delOnUnfollowBangumi off -> pgc tag kept');
 
 // ---- summary ----
 console.log(`\n${passed} passed, ${failed} failed`);
