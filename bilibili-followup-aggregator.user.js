@@ -2,7 +2,7 @@
 // @name         B站关注动态聚合器 - 视频补课与增量归档
 // @name:en      Bilibili Follow Feed Aggregator - Video Backfill & Incremental Archive
 // @namespace    https://github.com/dnasdw
-// @version      2.5.0
+// @version      2.6.0
 // @description  聚合全部关注UP主的视频动态（正式投稿+动态视频），按发布时间重建完整时间线。绕过B站关注动态页只能回看约75天历史的限制：支持从任意日期回溯补课（可扫到每个UP的第一条动态）、增量归档、断点续扫、新关注UP自动补全、多设备迁移
 // @description:en  Aggregate video dynamics (uploads + dynamic videos) from all followed creators into one timeline. Bypasses bilibili's ~75-day follow-feed history limit: backfill from any date (down to each creator's very first post), incremental updates, resumable scans, auto-backfill for newly followed creators, JSON export/import for migration.
 // @author       dnasdw
@@ -600,26 +600,43 @@
         DATA_KEY: 'bfua_data_v3',         // the big record store, written during scans
 
         defaultSettings() {
-            return { version: 1, defaultTab: 'all', delOnUnsubscribe: true, delOnUnfollow: true, delOnUnfollowBangumi: true };
+            return {
+                version: 1,
+                defaultTab: 'all',
+                delOnUnsubscribe: true,
+                delOnUnfollow: true,
+                delOnUnfollowBangumi: true,
+                pages: {}, // per-tab remembered page numbers (tiny, travels with exports)
+            };
         },
 
         loadSettings() {
             let raw = null;
             try { raw = GM_getValue(this.SETTINGS_KEY, null); } catch (e) { /* ignore */ }
+            let s = null;
             if (raw) {
-                try {
-                    const s = JSON.parse(raw);
-                    if (s && typeof s === 'object') {
-                        const d = this.defaultSettings();
-                        if (typeof s.defaultTab === 'string') d.defaultTab = s.defaultTab;
-                        d.delOnUnsubscribe = s.delOnUnsubscribe !== false;
-                        d.delOnUnfollow = s.delOnUnfollow !== false;
-                        d.delOnUnfollowBangumi = s.delOnUnfollowBangumi !== false;
-                        return d;
-                    }
-                } catch (e) { /* fall through to defaults */ }
+                try { s = JSON.parse(raw); } catch (e) { /* fall through */ }
             }
-            return this.defaultSettings();
+            const d = this.defaultSettings();
+            if (s && typeof s === 'object') {
+                if (typeof s.defaultTab === 'string') d.defaultTab = s.defaultTab;
+                d.delOnUnsubscribe = s.delOnUnsubscribe !== false;
+                d.delOnUnfollow = s.delOnUnfollow !== false;
+                d.delOnUnfollowBangumi = s.delOnUnfollowBangumi !== false;
+                if (s.pages && typeof s.pages === 'object') d.pages = s.pages;
+            }
+            // one-time migration of legacy per-tab page numbers from localStorage
+            if (!Object.keys(d.pages).length) {
+                let moved = false;
+                for (const tab of ['all', 'follow', 'pgc', 'season']) {
+                    try {
+                        const v = parseInt(localStorage.getItem('bfua_page_' + tab) || '', 10);
+                        if (Number.isFinite(v) && v >= 1) { d.pages[tab] = v; moved = true; }
+                    } catch (e) { /* ignore */ }
+                }
+                if (moved) this.saveSettings(d);
+            }
+            return d;
         },
 
         saveSettings(settings) {
@@ -1378,13 +1395,16 @@
             // per-change autosave caused visible lag. The default tab is read once
             // at page load - saving must NOT switch the in-memory current tab.
             this.els.settingsSave.addEventListener('click', () => {
+                if (!this._settings) this._settings = Store.loadSettings();
                 Store.saveSettings({
                     version: 1,
                     defaultTab: this.els.setDefaultTab.value,
                     delOnUnsubscribe: this.els.setDelUnsub.checked,
                     delOnUnfollow: this.els.setDelUnfollow.checked,
                     delOnUnfollowBangumi: this.els.setDelBangumi.checked,
+                    pages: this._settings.pages, // keep remembered page numbers
                 });
+                this._settings = Store.loadSettings();
                 this.els.settingsOverlay.classList.remove('open');
                 this.log('设置已保存（默认分类页将于下次刷新页面时生效）');
             });
@@ -1401,10 +1421,9 @@
                 if (!confirm('确定清空全部已聚合的视频数据？')) return;
                 Store.clear();
                 this.anchorBvid = null;
-                for (const t of this.TABS) {
-                    try { localStorage.removeItem('bfua_page_' + t.id); } catch (e) { /* ignore */ }
-                }
-                try { localStorage.removeItem('bfua_tab'); } catch (e) { /* ignore */ }
+                this._settings = Store.loadSettings();
+                this._settings.pages = {};
+                Store.saveSettings(this._settings);
                 this.currentTab = null;
                 this.renderStats();
                 this.renderList(1);
@@ -1413,6 +1432,7 @@
             });
 
             this.updateButtons();
+            this._settings = Store.loadSettings();
             this.currentTab = this.loadTab(); // read the default tab ONCE at page load
         },
 
@@ -1488,8 +1508,8 @@
         currentTab: null,
 
         /** The panel always opens on the configured default tab; in-session tab
-         *  switches live in memory only (per-tab page numbers stay remembered).
-         *  Reads the tiny settings key only - never touches the big data store. */
+         *  switches live in memory only. Per-tab page numbers persist in the
+         *  tiny settings key - never in the big data store, so paging stays fast. */
         loadTab() {
             const s = Store.loadSettings();
             return this.TABS.some((t) => t.id === s.defaultTab) ? s.defaultTab : 'all';
@@ -1535,12 +1555,15 @@
             this.renderList(Core.pageForAnchor(list, this.anchorBvid, CONFIG.listPageSize));
         },
 
-        /** persist current page (per-tab) in localStorage (separate from GM scan state to avoid write races) */
+        /** persist current page (per-tab) in the tiny settings key */
         savePage(page) {
-            try { localStorage.setItem('bfua_page_' + (this.currentTab || 'all'), String(page)); } catch (e) { /* ignore */ }
+            if (!this._settings) this._settings = Store.loadSettings();
+            this._settings.pages[this.currentTab || 'all'] = page;
+            Store.saveSettings(this._settings);
         },
         loadPage() {
-            const n = parseInt(localStorage.getItem('bfua_page_' + (this.currentTab || 'all')) || '1', 10);
+            if (!this._settings) this._settings = Store.loadSettings();
+            const n = parseInt(this._settings.pages[this.currentTab || 'all'] || '1', 10);
             return Number.isFinite(n) && n >= 1 ? n : 1;
         },
 
@@ -1706,6 +1729,7 @@
                         else if (info.lastTs && (!ex.lastTs || info.lastTs > ex.lastTs)) ex.lastTs = info.lastTs;
                     }
                 }
+                this._settings = Store.loadSettings(); // adopt imported settings (incl. pages)
                 Store.save(state);
                 this.log(`导入完成：新增 ${added} 条，合计 ${Object.keys(state.videos).length} 条（导入前 ${before} 条）`);
                 this.renderTabs();
