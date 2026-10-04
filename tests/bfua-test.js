@@ -329,9 +329,11 @@ assertEq(colPage.list[0].id, '12345', 'id stringified');
 // mergeVideos: sources union
 const mv = {};
 Core.mergeVideos(mv, [{ bvid: 'BVx', title: 't', pubTs: 1, sources: ['follow'] }]);
-const addedX = Core.mergeVideos(mv, [{ bvid: 'BVx', title: 't', pubTs: 1, sources: ['season'] }]);
+const addedX = Core.mergeVideos(mv, [{ bvid: 'BVx', title: 't', pubTs: 1, sources: ['season'], seasonId: '55', seasonName: '合集X' }]);
 assertEq(addedX, 0, 'cross-source merge is not a new record');
 assertEq(mv.BVx.sources.slice().sort(), ['follow', 'season'], 'sources unioned');
+assertEq(mv.BVx.seasonId, '55', 'seasonId backfilled on cross-source entry');
+assertEq(mv.BVx.seasonName, '合集X', 'seasonName backfilled on cross-source entry');
 
 // fmtDuration edge cases
 assertEq(Core.fmtDuration(0), '0:00', 'zero duration');
@@ -371,7 +373,7 @@ const pstate = {
     ups: { '1': { mid: '1', lastTs: 100 }, '2': { mid: '2', lastTs: 100 } },
     seasons: { '11': { seasonId: '11', lastTs: 1 }, '22': { seasonId: '22', lastTs: 1 }, '33': { seasonId: '33', lastTs: 1 } },
 };
-// live: only UP 2 and season 11 remain
+// live: only UP 2 and season 11 remain (liveSeasons=null must skip season pruning)
 const pr1 = Core.pruneSources(pstate, new Set(['2']), new Set(['11']), null, { delOnUnfollow: true, delOnUnsubscribe: true, delOnUnfollowBangumi: true });
 assertEq(pstate.videos.fo, undefined, 'follow-only video of unfollowed UP deleted');
 assertEq(pstate.videos.fs.sources, ['season'], 'cross-source video survives via still-subscribed season (removed from follow tab only)');
@@ -388,6 +390,12 @@ const pstate2 = {
     ups: { '1': { mid: '1', lastTs: 100 } },
     seasons: { '11': { seasonId: '11', lastTs: 1 } },
 };
+// null liveSeasons (collected enumeration failed) -> skip season pruning entirely
+const pstateNull = { videos: { se: { bvid: 'se', upMid: '2', seasonId: '22', sources: ['season'] } }, ups: {}, seasons: { '22': { seasonId: '22', lastTs: 1 } } };
+Core.pruneSources(pstateNull, new Set(['2']), null, null, { delOnUnfollow: true, delOnUnsubscribe: true, delOnUnfollowBangumi: true });
+assertEq(pstateNull.videos.se.bvid, 'se', 'null liveSeasons -> no season pruning');
+assertEq(pstateNull.seasons['22'].seasonId, '22', 'null liveSeasons -> seasons table untouched');
+
 // season 11 unsubscribed + UP unfollowed, but delOnUnfollow disabled -> follow tag survives
 const pr2 = Core.pruneSources(pstate2, new Set(), new Set(), null, { delOnUnfollow: false, delOnUnsubscribe: true, delOnUnfollowBangumi: true });
 assertEq(pstate2.videos.fs.sources, ['follow'], 'season tag removed, follow tag kept (setting off)');

@@ -2,7 +2,7 @@
 // @name         B站关注动态聚合器 - 视频补课与增量归档
 // @name:en      Bilibili Follow Feed Aggregator - Video Backfill & Incremental Archive
 // @namespace    https://github.com/dnasdw
-// @version      2.3.1
+// @version      2.3.2
 // @description  聚合全部关注UP主的视频动态（正式投稿+动态视频），按发布时间重建完整时间线。绕过B站关注动态页只能回看约75天历史的限制：支持从任意日期回溯补课（可扫到每个UP的第一条动态）、增量归档、断点续扫、新关注UP自动补全、多设备迁移
 // @description:en  Aggregate video dynamics (uploads + dynamic videos) from all followed creators into one timeline. Bypasses bilibili's ~75-day follow-feed history limit: backfill from any date (down to each creator's very first post), incremental updates, resumable scans, auto-backfill for newly followed creators, JSON export/import for migration.
 // @author       dnasdw
@@ -157,6 +157,11 @@
                 else {
                     if (!ex.cover && v.cover) ex.cover = v.cover;
                     if (!ex.badge && v.badge) ex.badge = v.badge;
+                    // cross-source entries often arrive via the UP-dynamic lane first
+                    // (no seasonId); backfill it from the season lane so the
+                    // unsubscribe cleanup can judge them accurately
+                    if (!ex.seasonId && v.seasonId) ex.seasonId = v.seasonId;
+                    if (!ex.seasonName && v.seasonName) ex.seasonName = v.seasonName;
                     for (const s of v.sources || []) {
                         if (ex.sources.indexOf(s) === -1) ex.sources.push(s);
                     }
@@ -367,7 +372,7 @@
                     if (!liveFollows.has(mid)) state.ups[mid].lastTs = 0; // re-follow -> full backfill
                 }
             }
-            if (unsub) {
+            if (unsub && liveSeasons) {
                 for (const v of Object.values(state.videos)) {
                     if (!state.videos[v.bvid]) continue; // may have been deleted above
                     const i = (v.sources || []).indexOf('season');
@@ -851,26 +856,32 @@
             return all;
         },
 
-        /** Enumerate "我追的" entries, probing each to keep only ugc seasons (folders are skipped). */
+        /** Enumerate "我追的" entries, probing each to keep only ugc seasons (folders are skipped).
+         *  A transient probe failure aborts the whole enumeration (returns null)
+         *  rather than risking a false "unsubscribed" verdict in the cleanup. */
         async getCollectedSeasons(myMid) {
             const seasons = [];
             let pn = 1;
-            for (;;) {
-                const json = await apiGet(API.collectedList(myMid, pn), 'https://space.bilibili.com/');
-                const page = Core.parseCollectedList(json);
-                for (const it of page.list) {
-                    try {
+            try {
+                for (;;) {
+                    const json = await apiGet(API.collectedList(myMid, pn), 'https://space.bilibili.com/');
+                    const page = Core.parseCollectedList(json);
+                    for (const it of page.list) {
                         const probe = await apiGet(API.seasonArchives(it.mid || myMid, it.id, 1), `https://space.bilibili.com/`);
                         const meta = (probe.data && probe.data.meta) || {};
                         if (String(meta.season_id) === it.id) {
                             seasons.push({ seasonId: it.id, title: meta.name || it.title, mid: String(meta.mid || it.mid || '') });
                         }
-                    } catch (e) { /* entry is a fav folder or request failed - skip */ }
+                        // meta mismatch -> a fav folder, legitimately skipped
+                    }
+                    if (seasons.length >= page.total || !page.list.length || pn >= 20) break;
+                    pn++;
                 }
-                if (seasons.length >= page.total || !page.list.length || pn >= 20) break;
-                pn++;
+                return seasons;
+            } catch (e) {
+                UI.log(`订阅合集列表获取失败(${e.message})，本次跳过合集内容与对应清理`, 'warn');
+                return null;
             }
-            return seasons;
         },
 
         /** Mark a UP as scanned just now (its incremental floor for next time). */
@@ -999,7 +1010,8 @@
                     const myMid = nav.data.mid;
                     const followings = await this.getFollowings(myMid);
                     UI.log('正在枚举"我追的"订阅合集...');
-                    const collectedSeasons = await this.getCollectedSeasons(myMid);
+                    const collected = await this.getCollectedSeasons(myMid);
+                    const collectedSeasons = collected || [];
                     UI.log('正在枚举追番追剧列表...');
                     const bangumi = await this.getBangumiFollows(myMid);
                     const bangumiFollows = bangumi ? bangumi.follows : [];
@@ -1008,7 +1020,7 @@
                     if (mode === 'increment') {
                         // apply unfollow/unsubscribe/un-bangumi cleanup according to settings
                         const liveFollows = new Set(followings.map((u) => u.mid));
-                        const liveSeasons = new Set(collectedSeasons.map((s) => s.seasonId));
+                        const liveSeasons = collected ? new Set(collectedSeasons.map((s) => s.seasonId)) : null;
                         const pr = Core.pruneSources(state, liveFollows, liveSeasons, liveBangumi, state.settings);
                         if (pr.removedVideos || pr.untagged) {
                             UI.log(`取关/退订清理：删除 ${pr.removedVideos} 条记录，${pr.untagged} 条移出对应分类`);
