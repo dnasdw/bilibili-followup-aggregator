@@ -267,23 +267,34 @@ assertEq(Core.pageForAnchor([], 'v1', 20), 1, 'empty list -> page 1');
 // ---- v2: sources/seasons/pgc/tabs/prune ----
 console.log('\n# v2.0 features');
 
-// parsePgcPage
+// parsePgcPage (fields verified against a real DYNAMIC_TYPE_PGC_UNION response)
 const pgcJson = {
     data: {
         has_more: true, offset: '555',
         items: [
             {
-                type: 'DYNAMIC_TYPE_PGC',
+                type: 'DYNAMIC_TYPE_PGC_UNION',
                 modules: {
                     module_author: { mid: 928123, name: '番剧出差', face: 'http://i0.hdslb.com/face/x.jpg', pub_ts: 1750000000 },
-                    module_dynamic: { major: { pgc: { epid: 888888, season_id: 777, title: '某番剧', sub_title: '第2话', cover: 'http://i0.hdslb.com/pgc/x.jpg', url: '//www.bilibili.com/bangumi/play/ep888888', season_type: 1 } } },
+                    module_dynamic: { major: { pgc: {
+                        type: 2, sub_type: '0', season_id: '26421', epid: '6497987',
+                        title: '这就是中国：第350集 沙漠绿色奇迹',
+                        cover: 'http://i0.hdslb.com/bfs/archive/765d26898e7a3395222be3aa5c068c521000d60f.jpg',
+                        badge: { text: '纪录片' },
+                        jump_url: 'https://www.bilibili.com/bangumi/play/ep6497987',
+                    } } },
                 },
             },
             {
                 type: 'DYNAMIC_TYPE_PGC',
                 modules: {
                     module_author: { mid: 928123, name: '番剧出差', face: '', pub_ts: 1740000000 },
-                    module_dynamic: { major: { pgc: { epid: 999999, season_id: 778, title: '某电视剧', sub_title: '更新', cover: '', url: '', season_type: 5 } } },
+                    module_dynamic: { major: { pgc: {
+                        season_id: '778', epid: '999999',
+                        title: '某番剧 第2话', cover: '',
+                        jump_url: '//www.bilibili.com/bangumi/play/ep999999',
+                        season_type: 1,
+                    } } },
                 },
             },
             { type: 'DYNAMIC_TYPE_AV', modules: { module_author: { mid: 1, pub_ts: 1750000100 }, module_dynamic: { major: { archive: { bvid: 'BVx' } } } } },
@@ -291,12 +302,13 @@ const pgcJson = {
     },
 };
 const pgcPage = Core.parsePgcPage(pgcJson, 0);
-assertEq(pgcPage.videos.length, 2, 'pgc items collected, AV item skipped');
-assertEq(pgcPage.videos[0].bvid, 'ep888888', 'pseudo bvid ep{id}');
-assertEq(pgcPage.videos[0].badge, '追番', 'anime badge');
-assertEq(pgcPage.videos[1].badge, '追剧', 'drama badge (season_type 5)');
-assertEq(pgcPage.videos[0].url, 'https://www.bilibili.com/bangumi/play/ep888888', 'protocol-relative url fixed');
-assertEq(pgcPage.videos[0].url2 !== undefined ? 1 : (pgcPage.videos[1].url.indexOf('https://') === 0 ? 1 : 0), 1, 'empty url falls back to ep page');
+assertEq(pgcPage.videos.length, 2, 'pgc/union items collected, AV item skipped');
+assertEq(pgcPage.videos[0].bvid, 'ep6497987', 'pseudo bvid ep{id}');
+assertEq(pgcPage.videos[0].badge, '纪录片', 'official badge text used');
+assertEq(pgcPage.videos[1].badge, '追番', 'badge fallback when missing');
+assertEq(pgcPage.videos[0].title, '这就是中国：第350集 沙漠绿色奇迹', 'title carries show+episode');
+assertEq(pgcPage.videos[0].url, 'https://www.bilibili.com/bangumi/play/ep6497987', 'jump_url used as link');
+assertEq(pgcPage.videos[1].url, 'https://www.bilibili.com/bangumi/play/ep999999', 'protocol-relative jump_url fixed');
 assertEq(pgcPage.videos[0].sources, ['pgc'], 'pgc sources');
 assertEq(pgcPage.ups['928123'].face, 'https://i0.hdslb.com/face/x.jpg', 'pgc author face http->https');
 assertEq(Core.parsePgcPage(pgcJson, 1745000000).videos.length, 1, 'sinceTs filters old pgc items');
@@ -407,7 +419,7 @@ assertEq(bfPage.total, 3, 'total passthrough');
 assertEq(bfPage.hasNext, true, 'has_next passthrough');
 
 // parsePgcPage records seasonId (needed for un-bangumi cleanup)
-assertEq(pgcPage.videos[0].seasonId, '777', 'pgc seasonId recorded');
+assertEq(pgcPage.videos[0].seasonId, '26421', 'pgc seasonId recorded');
 assertEq(pgcPage.videos[1].seasonId, '778', 'second pgc seasonId');
 
 // pruneSources: pgc dimension (new signature with liveBangumi)
