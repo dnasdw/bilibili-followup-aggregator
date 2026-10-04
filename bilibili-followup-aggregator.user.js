@@ -1350,7 +1350,6 @@
                 settingsBtn: panel.querySelector('#bfua-settings'),
                 settingsOverlay: overlay,
                 settingsClose: overlay.querySelector('#bfua-settings-close'),
-                settingsSave: overlay.querySelector('#bfua-settings-save'),
                 setDefaultTab: overlay.querySelector('#bfua-set-default-tab'),
                 setDelUnsub: overlay.querySelector('#bfua-set-del-unsub'),
                 setDelUnfollow: overlay.querySelector('#bfua-set-del-unfollow'),
