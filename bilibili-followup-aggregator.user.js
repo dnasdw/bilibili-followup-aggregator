@@ -2,7 +2,7 @@
 // @name         B站关注动态聚合器 - 视频补课与增量归档
 // @name:en      Bilibili Follow Feed Aggregator - Video Backfill & Incremental Archive
 // @namespace    https://github.com/dnasdw
-// @version      2.6.1
+// @version      2.6.2
 // @description  聚合全部关注UP主的视频动态（正式投稿+动态视频），按发布时间重建完整时间线。绕过B站关注动态页只能回看约75天历史的限制：支持从任意日期回溯补课（可扫到每个UP的第一条动态）、增量归档、断点续扫、新关注UP自动补全、多设备迁移
 // @description:en  Aggregate video dynamics (uploads + dynamic videos) from all followed creators into one timeline. Bypasses bilibili's ~75-day follow-feed history limit: backfill from any date (down to each creator's very first post), incremental updates, resumable scans, auto-backfill for newly followed creators, JSON export/import for migration.
 // @author       dnasdw
@@ -1322,8 +1322,7 @@
   <label><input type="checkbox" id="bfua-set-del-unsub"> 取消订阅合集时移除对应记录</label>
   <label><input type="checkbox" id="bfua-set-del-unfollow"> 取消关注UP主时移除对应记录</label>
   <label><input type="checkbox" id="bfua-set-del-bangumi"> 取消追番追剧时移除对应记录</label>
-  <div style="color:#9499a0;font-size:12px;line-height:1.6;margin:8px 0">说明：默认分类标签页在页面加载时读取，修改后下次刷新页面生效。交叉来源的视频只会移出对应分类页，所有来源都移除后才删除本地记录。</div>
-  <button class="bfua-btn primary" id="bfua-settings-save" style="width:100%">保存</button>
+  <div style="color:#9499a0;font-size:12px;line-height:1.6;margin:8px 0">说明：更改即时生效。默认分类标签页在页面加载时读取，修改后下次刷新页面生效。交叉来源的视频只会移出对应分类页，所有来源都移除后才删除本地记录。</div>
 </div>
 `;
             document.body.appendChild(overlay);
@@ -1394,7 +1393,10 @@
             // save on button only: writing the full state to GM storage is heavy,
             // per-change autosave caused visible lag. The default tab is read once
             // at page load - saving must NOT switch the in-memory current tab.
-            this.els.settingsSave.addEventListener('click', () => {
+            // auto-save: settings live in their own tiny storage key, so writing
+            // on every change is instant. The default tab is read once at page
+            // load - changing it must NOT switch the in-memory current tab.
+            const applySettings = () => {
                 if (!this._settings) this._settings = Store.loadSettings();
                 Store.saveSettings({
                     version: 1,
@@ -1402,12 +1404,14 @@
                     delOnUnsubscribe: this.els.setDelUnsub.checked,
                     delOnUnfollow: this.els.setDelUnfollow.checked,
                     delOnUnfollowBangumi: this.els.setDelBangumi.checked,
-                    pages: this._settings.pages, // keep remembered page numbers
+                    pages: this._settings.pages,
                 });
                 this._settings = Store.loadSettings();
-                this.els.settingsOverlay.classList.remove('open');
-                this.log('设置已保存（默认分类页将于下次刷新页面时生效）');
-            });
+            };
+            this.els.setDefaultTab.addEventListener('change', applySettings);
+            this.els.setDelUnsub.addEventListener('change', applySettings);
+            this.els.setDelUnfollow.addEventListener('change', applySettings);
+            this.els.setDelBangumi.addEventListener('change', applySettings);
             this.els.importBtn.addEventListener('click', () => {
                 if (ScanEngine.running) { this.log('扫描进行中，请先停止再导入', 'warn'); return; }                this.els.importFile.value = '';
                 this.els.importFile.click();
