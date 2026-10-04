@@ -2,7 +2,7 @@
 // @name         B站关注动态聚合器 - 视频补课与增量归档
 // @name:en      Bilibili Follow Feed Aggregator - Video Backfill & Incremental Archive
 // @namespace    https://github.com/dnasdw
-// @version      2.4.1
+// @version      2.5.0
 // @description  聚合全部关注UP主的视频动态（正式投稿+动态视频），按发布时间重建完整时间线。绕过B站关注动态页只能回看约75天历史的限制：支持从任意日期回溯补课（可扫到每个UP的第一条动态）、增量归档、断点续扫、新关注UP自动补全、多设备迁移
 // @description:en  Aggregate video dynamics (uploads + dynamic videos) from all followed creators into one timeline. Bypasses bilibili's ~75-day follow-feed history limit: backfill from any date (down to each creator's very first post), incremental updates, resumable scans, auto-backfill for newly followed creators, JSON export/import for migration.
 // @author       dnasdw
@@ -596,45 +596,96 @@
     // ============================ Storage ============================
 
     const Store = {
-        load() {
-            const fresh = () => ({
-                version: 3,
-                videos: {}, ups: {}, seasons: {},
-                settings: { defaultTab: 'all', delOnUnsubscribe: true, delOnUnfollow: true, delOnUnfollowBangumi: true },
-                lastScanTs: 0, globalFloorTs: 0, scan: null,
-            });
+        SETTINGS_KEY: 'bfua_settings_v1', // tiny, read/written instantly
+        DATA_KEY: 'bfua_data_v3',         // the big record store, written during scans
+
+        defaultSettings() {
+            return { version: 1, defaultTab: 'all', delOnUnsubscribe: true, delOnUnfollow: true, delOnUnfollowBangumi: true };
+        },
+
+        loadSettings() {
             let raw = null;
-            try { raw = GM_getValue(CONFIG.storageKey, null); } catch (e) { return fresh(); }
-            if (!raw) return fresh();
-            let state;
-            try { state = JSON.parse(raw); } catch (e) { return fresh(); }
-            if (!state || typeof state.videos !== 'object') return fresh();
-            if (state.version === 1) {
-                state = Core.migrateV1ToV2(state); // dedupe per-video face/upName into an ups table
+            try { raw = GM_getValue(this.SETTINGS_KEY, null); } catch (e) { /* ignore */ }
+            if (raw) {
+                try {
+                    const s = JSON.parse(raw);
+                    if (s && typeof s === 'object') {
+                        const d = this.defaultSettings();
+                        if (typeof s.defaultTab === 'string') d.defaultTab = s.defaultTab;
+                        d.delOnUnsubscribe = s.delOnUnsubscribe !== false;
+                        d.delOnUnfollow = s.delOnUnfollow !== false;
+                        d.delOnUnfollowBangumi = s.delOnUnfollowBangumi !== false;
+                        return d;
+                    }
+                } catch (e) { /* fall through to defaults */ }
             }
-            if (state.version === 2) {
-                state = Core.migrateV2ToV3(state); // add sources/seasons/settings
+            return this.defaultSettings();
+        },
+
+        saveSettings(settings) {
+            try { GM_setValue(this.SETTINGS_KEY, JSON.stringify(settings)); } catch (e) { /* ignore */ }
+        },
+
+        freshData() {
+            return { version: 3, videos: {}, ups: {}, seasons: {}, lastScanTs: 0, globalFloorTs: 0, scan: null };
+        },
+
+        loadData() {
+            let raw = null;
+            try { raw = GM_getValue(this.DATA_KEY, null); } catch (e) { /* ignore */ }
+            if (!raw) {
+                // one-time migration from the legacy single-key state
+                let legacy = null;
+                try { legacy = GM_getValue(CONFIG.storageKey, null); } catch (e) { /* ignore */ }
+                if (!legacy) return this.freshData();
+                let st = null;
+                try { st = JSON.parse(legacy); } catch (e) { return this.freshData(); }
+                if (!st || typeof st.videos !== 'object') return this.freshData();
+                if (st.version === 1) st = Core.migrateV1ToV2(st);
+                if (st.version === 2) st = Core.migrateV2ToV3(st);
+                if (st.version !== 3) return this.freshData();
+                const settings = st.settings || this.defaultSettings();
+                delete st.settings;
+                try {
+                    GM_setValue(this.DATA_KEY, JSON.stringify(st));
+                    this.saveSettings(settings);
+                    GM_deleteValue(CONFIG.storageKey);
+                } catch (e) { /* persist next save */ }
+                return st;
             }
-            if (state.version !== 3) return fresh();
-            try { GM_setValue(CONFIG.storageKey, JSON.stringify(state)); } catch (e) { /* persist next save */ }
+            let state = null;
+            try { state = JSON.parse(raw); } catch (e) { return this.freshData(); }
+            if (!state || state.version !== 3 || typeof state.videos !== 'object') return this.freshData();
             if (!state.ups || typeof state.ups !== 'object') state.ups = {};
             if (!state.seasons || typeof state.seasons !== 'object') state.seasons = {};
-            if (!state.settings || typeof state.settings !== 'object') {
-                state.settings = { defaultTab: 'all', delOnUnsubscribe: true, delOnUnfollow: true, delOnUnfollowBangumi: true };
-            }
-            if (typeof state.settings.delOnUnfollowBangumi !== 'boolean') state.settings.delOnUnfollowBangumi = true;
-            if (typeof state.globalFloorTs !== 'number' || !state.globalFloorTs) {
-                // 0 = "backfill new UPs to their very first dynamic" (scan-to-bottom)
-                state.globalFloorTs = 0;
-            }
+            if (typeof state.globalFloorTs !== 'number' || !state.globalFloorTs) state.globalFloorTs = 0;
+            if (typeof state.lastScanTs !== 'number') state.lastScanTs = 0;
             if (!state.scan || !Array.isArray(state.scan.queue)) state.scan = null;
             return state;
         },
-        save(state) {
-            GM_setValue(CONFIG.storageKey, JSON.stringify(state));
+
+        saveData(state) {
+            const { settings, ...dataOnly } = state;
+            try { GM_setValue(this.DATA_KEY, JSON.stringify(dataOnly)); } catch (e) { /* ignore */ }
         },
+
+        /** combined view for callers that need everything (scans, renders, exports) */
+        load() {
+            const data = this.loadData();
+            data.settings = this.loadSettings();
+            return data;
+        },
+
+        /** writes both keys; keeps them consistent */
+        save(state) {
+            if (state.settings) this.saveSettings(state.settings);
+            this.saveData(state);
+        },
+
         clear() {
-            GM_deleteValue(CONFIG.storageKey);
+            try { GM_deleteValue(this.DATA_KEY); } catch (e) { /* ignore */ }
+            try { GM_deleteValue(this.SETTINGS_KEY); } catch (e) { /* ignore */ }
+            try { GM_deleteValue(CONFIG.storageKey); } catch (e) { /* ignore */ }
         },
     };
 
@@ -1327,14 +1378,13 @@
             // per-change autosave caused visible lag. The default tab is read once
             // at page load - saving must NOT switch the in-memory current tab.
             this.els.settingsSave.addEventListener('click', () => {
-                const state = Store.load();
-                state.settings = {
+                Store.saveSettings({
+                    version: 1,
                     defaultTab: this.els.setDefaultTab.value,
                     delOnUnsubscribe: this.els.setDelUnsub.checked,
                     delOnUnfollow: this.els.setDelUnfollow.checked,
                     delOnUnfollowBangumi: this.els.setDelBangumi.checked,
-                };
-                Store.save(state);
+                });
                 this.els.settingsOverlay.classList.remove('open');
                 this.log('设置已保存（默认分类页将于下次刷新页面时生效）');
             });
@@ -1438,11 +1488,11 @@
         currentTab: null,
 
         /** The panel always opens on the configured default tab; in-session tab
-         *  switches live in memory only (per-tab page numbers stay remembered). */
+         *  switches live in memory only (per-tab page numbers stay remembered).
+         *  Reads the tiny settings key only - never touches the big data store. */
         loadTab() {
-            const state = Store.load();
-            const tab = state.settings.defaultTab;
-            return this.TABS.some((t) => t.id === tab) ? tab : 'all';
+            const s = Store.loadSettings();
+            return this.TABS.some((t) => t.id === s.defaultTab) ? s.defaultTab : 'all';
         },
 
         renderTabs() {
