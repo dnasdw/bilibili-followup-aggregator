@@ -2,7 +2,7 @@
 // @name         B站关注动态聚合器 - 视频补课与增量归档
 // @name:en      Bilibili Follow Feed Aggregator - Video Backfill & Incremental Archive
 // @namespace    https://github.com/dnasdw
-// @version      2.3.2
+// @version      2.3.3
 // @description  聚合全部关注UP主的视频动态（正式投稿+动态视频），按发布时间重建完整时间线。绕过B站关注动态页只能回看约75天历史的限制：支持从任意日期回溯补课（可扫到每个UP的第一条动态）、增量归档、断点续扫、新关注UP自动补全、多设备迁移
 // @description:en  Aggregate video dynamics (uploads + dynamic videos) from all followed creators into one timeline. Bypasses bilibili's ~75-day follow-feed history limit: backfill from any date (down to each creator's very first post), incremental updates, resumable scans, auto-backfill for newly followed creators, JSON export/import for migration.
 // @author       dnasdw
@@ -1066,12 +1066,14 @@
                         UI.progress(scan.done, total, entry.name || entry.mid);
                         try {
                             let found = 0;
-                            if (entry.kind === 'season') {
-                                const seasonSince = (scan.mode === 'increment')
-                                    ? ((state.seasons[entry.seasonId] && state.seasons[entry.seasonId].lastTs) || state.globalFloorTs)
-                                    : sinceTs;
-                                found = await this.scanSeason(entry, seasonSince, state);
-                            } else if (entry.kind === 'bangumi') {
+                        if (entry.kind === 'season') {
+                            // always pull the WHOLE season (id-deduped): seasons are
+                            // short (a few pages), and trusting per-season lastTs let
+                            // a past increment advance the timestamp while entries
+                            // were lost to a parser bug - tags never healed. Full
+                            // pulls make source tags and entries self-healing.
+                            found = await this.scanSeason(entry, 0, state);
+                        } else if (entry.kind === 'bangumi') {
                                 found = await this.scanBangumi(entry, state);
                             } else {
                                 const upSince = (scan.mode === 'increment')
