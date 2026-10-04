@@ -2,7 +2,7 @@
 // @name         B站关注动态聚合器 - 视频补课与增量归档
 // @name:en      Bilibili Follow Feed Aggregator - Video Backfill & Incremental Archive
 // @namespace    https://github.com/dnasdw
-// @version      2.6.2
+// @version      2.6.3
 // @description  聚合全部关注UP主的视频动态（正式投稿+动态视频），按发布时间重建完整时间线。绕过B站关注动态页只能回看约75天历史的限制：支持从任意日期回溯补课（可扫到每个UP的第一条动态）、增量归档、断点续扫、新关注UP自动补全、多设备迁移
 // @description:en  Aggregate video dynamics (uploads + dynamic videos) from all followed creators into one timeline. Bypasses bilibili's ~75-day follow-feed history limit: backfill from any date (down to each creator's very first post), incremental updates, resumable scans, auto-backfill for newly followed creators, JSON export/import for migration.
 // @author       dnasdw
@@ -320,8 +320,8 @@
         parseBangumiFollowList(json) {
             const data = (json && json.data) || {};
             const list = (data.list || [])
-                .map((it) => String(it.season_id || ''))
-                .filter(Boolean);
+                .map((it) => ({ seasonId: String(it.season_id || ''), title: it.title || '' }))
+                .filter((it) => it.seasonId);
             return {
                 list,
                 total: Number(data.total) || list.length,
@@ -1019,7 +1019,7 @@
                         const json = await apiGet(API.bangumiFollow(myMid, type, pn), `https://space.bilibili.com/${myMid}/bangumi`);
                         const page = Core.parseBangumiFollowList(json);
                         for (const it of page.list) {
-                            if (!liveSet.has(it)) { liveSet.add(it); follows.push({ seasonId: it }); }
+                            if (!liveSet.has(it.seasonId)) { liveSet.add(it.seasonId); follows.push({ seasonId: it.seasonId, title: it.title }); }
                         }
                         if (!page.hasNext || !page.list.length || pn >= 30) break;
                         pn++;
@@ -1100,7 +1100,7 @@
                     const lanes = [
                         followings.map((u) => ({ kind: 'up', mid: u.mid, name: u.uname })),
                         collectedSeasons.map((s) => ({ kind: 'season', seasonId: s.seasonId, mid: s.mid, name: s.title })),
-                        bangumiFollows.map((b) => ({ kind: 'bangumi', seasonId: b.seasonId, name: `追番 ${b.seasonId}` })),
+                        bangumiFollows.map((b) => ({ kind: 'bangumi', seasonId: b.seasonId, name: b.title || `追番 ${b.seasonId}` })),
                     ];
                     const queue = [];
                     let remaining = lanes.reduce((n, l) => n + l.length, 0);

@@ -405,7 +405,7 @@ assertEq(pstate2.seasons['11'], undefined, 'season entry removed regardless');
 const bfPage = Core.parseBangumiFollowList({ data: { total: 3, has_next: true, list: [
     { season_id: 111, title: '番A' }, { season_id: 222, title: '剧B' }, { title: 'broken' },
 ] } });
-assertEq(bfPage.list, ['111', '222'], 'season ids stringified, broken filtered');
+assertEq(bfPage.list, [{ seasonId: '111', title: '番A' }, { seasonId: '222', title: '剧B' }], 'season ids + titles, broken filtered');
 assertEq(bfPage.total, 3, 'total passthrough');
 assertEq(bfPage.hasNext, true, 'has_next passthrough');
 
