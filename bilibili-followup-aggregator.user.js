@@ -2,7 +2,7 @@
 // @name         B站关注动态聚合器 - 视频补课与增量归档
 // @name:en      Bilibili Follow Feed Aggregator - Video Backfill & Incremental Archive
 // @namespace    https://github.com/dnasdw
-// @version      2.1.3
+// @version      2.1.4
 // @description  聚合全部关注UP主的视频动态（正式投稿+动态视频），按发布时间重建完整时间线。绕过B站关注动态页只能回看约75天历史的限制：支持从任意日期回溯补课（可扫到每个UP的第一条动态）、增量归档、断点续扫、新关注UP自动补全、多设备迁移
 // @description:en  Aggregate video dynamics (uploads + dynamic videos) from all followed creators into one timeline. Bypasses bilibili's ~75-day follow-feed history limit: backfill from any date (down to each creator's very first post), incremental updates, resumable scans, auto-backfill for newly followed creators, JSON export/import for migration.
 // @author       dnasdw
@@ -1078,10 +1078,14 @@
                     Store.save(state); // persist after every entry for resumability
                 }
 
-                // bangumi/drama updates via the follow feed (~75-day window)
+                // bangumi/drama updates: ALWAYS pull the whole ~75-day window and
+                // dedup by id. The feed is short and low-volume, so this is cheap,
+                // and it makes the source immune to timestamp gaps (e.g. a past
+                // scan with a broken parser advancing lastScanTs while collecting
+                // nothing - that window is recovered automatically on every run).
                 try {
-                    const pgcSince = (scan.mode === 'increment') ? (state.lastScanTs || 0) : sinceTs;
-                    console.log('[bfua] pgc phase start, since =', pgcSince, new Date(pgcSince * 1000).toISOString());
+                    const pgcSince = 0;
+                    console.log('[bfua] pgc phase start (full window)');
                     const pgcFound = await this.scanPgc(pgcSince, state);
                     console.log('[bfua] pgc phase done, found =', pgcFound);
                     UI.log(`追番追剧: +${pgcFound} 条`);
