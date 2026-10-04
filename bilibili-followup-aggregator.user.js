@@ -2,7 +2,7 @@
 // @name         B站关注动态聚合器 - 视频补课与增量归档
 // @name:en      Bilibili Follow Feed Aggregator - Video Backfill & Incremental Archive
 // @namespace    https://github.com/dnasdw
-// @version      2.4.0
+// @version      2.4.1
 // @description  聚合全部关注UP主的视频动态（正式投稿+动态视频），按发布时间重建完整时间线。绕过B站关注动态页只能回看约75天历史的限制：支持从任意日期回溯补课（可扫到每个UP的第一条动态）、增量归档、断点续扫、新关注UP自动补全、多设备迁移
 // @description:en  Aggregate video dynamics (uploads + dynamic videos) from all followed creators into one timeline. Bypasses bilibili's ~75-day follow-feed history limit: backfill from any date (down to each creator's very first post), incremental updates, resumable scans, auto-backfill for newly followed creators, JSON export/import for migration.
 // @author       dnasdw
@@ -1254,7 +1254,8 @@
   <label><input type="checkbox" id="bfua-set-del-unsub"> 取消订阅合集时移除对应记录</label>
   <label><input type="checkbox" id="bfua-set-del-unfollow"> 取消关注UP主时移除对应记录</label>
   <label><input type="checkbox" id="bfua-set-del-bangumi"> 取消追番追剧时移除对应记录</label>
-  <div style="color:#9499a0;font-size:12px;line-height:1.6;margin:8px 0">说明：更改即时生效。交叉来源的视频（既是UP动态又在订阅合集中）只会移出对应分类页，所有来源都移除后才删除本地记录。</div>
+  <div style="color:#9499a0;font-size:12px;line-height:1.6;margin:8px 0">说明：默认分类标签页在页面加载时读取，修改后下次刷新页面生效。交叉来源的视频只会移出对应分类页，所有来源都移除后才删除本地记录。</div>
+  <button class="bfua-btn primary" id="bfua-settings-save" style="width:100%">保存</button>
 </div>
 `;
             document.body.appendChild(overlay);
@@ -1282,6 +1283,7 @@
                 settingsBtn: panel.querySelector('#bfua-settings'),
                 settingsOverlay: overlay,
                 settingsClose: overlay.querySelector('#bfua-settings-close'),
+                settingsSave: overlay.querySelector('#bfua-settings-save'),
                 setDefaultTab: overlay.querySelector('#bfua-set-default-tab'),
                 setDelUnsub: overlay.querySelector('#bfua-set-del-unsub'),
                 setDelUnfollow: overlay.querySelector('#bfua-set-del-unfollow'),
@@ -1290,13 +1292,7 @@
 
             fab.addEventListener('click', () => {
                 const isOpen = panel.classList.toggle('open');
-                if (isOpen) {
-                    this.currentTab = null; // reopen on the configured default tab
-                    this.renderTabs();
-                    this.renderStats();
-                    this.renderList(this.loadPage());
-                    this.updateButtons();
-                }
+                if (isOpen) { this.renderTabs(); this.renderStats(); this.renderList(this.loadPage()); this.updateButtons(); }
             });
             // quick paging with arrow keys while the panel is open
             document.addEventListener('keydown', (e) => {
@@ -1327,8 +1323,10 @@
             this.els.settingsOverlay.addEventListener('click', (e) => {
                 if (e.target === this.els.settingsOverlay) this.els.settingsOverlay.classList.remove('open');
             });
-            // settings apply immediately, no save button
-            const applySettings = () => {
+            // save on button only: writing the full state to GM storage is heavy,
+            // per-change autosave caused visible lag. The default tab is read once
+            // at page load - saving must NOT switch the in-memory current tab.
+            this.els.settingsSave.addEventListener('click', () => {
                 const state = Store.load();
                 state.settings = {
                     defaultTab: this.els.setDefaultTab.value,
@@ -1337,15 +1335,9 @@
                     delOnUnfollowBangumi: this.els.setDelBangumi.checked,
                 };
                 Store.save(state);
-                // apply the (possibly new) default tab immediately
-                this.currentTab = state.settings.defaultTab;
-                this.renderTabs();
-                this.renderList(this.loadPage());
-            };
-            this.els.setDefaultTab.addEventListener('change', applySettings);
-            this.els.setDelUnsub.addEventListener('change', applySettings);
-            this.els.setDelUnfollow.addEventListener('change', applySettings);
-            this.els.setDelBangumi.addEventListener('change', applySettings);
+                this.els.settingsOverlay.classList.remove('open');
+                this.log('设置已保存（默认分类页将于下次刷新页面时生效）');
+            });
             this.els.importBtn.addEventListener('click', () => {
                 if (ScanEngine.running) { this.log('扫描进行中，请先停止再导入', 'warn'); return; }                this.els.importFile.value = '';
                 this.els.importFile.click();
@@ -1371,6 +1363,7 @@
             });
 
             this.updateButtons();
+            this.currentTab = this.loadTab(); // read the default tab ONCE at page load
         },
 
         updateButtons() {
