@@ -2,7 +2,7 @@
 // @name         B站关注动态聚合器 - 视频补课与增量归档
 // @name:en      Bilibili Follow Feed Aggregator - Video Backfill & Incremental Archive
 // @namespace    https://github.com/dnasdw
-// @version      2.1.4
+// @version      2.2.0
 // @description  聚合全部关注UP主的视频动态（正式投稿+动态视频），按发布时间重建完整时间线。绕过B站关注动态页只能回看约75天历史的限制：支持从任意日期回溯补课（可扫到每个UP的第一条动态）、增量归档、断点续扫、新关注UP自动补全、多设备迁移
 // @description:en  Aggregate video dynamics (uploads + dynamic videos) from all followed creators into one timeline. Bypasses bilibili's ~75-day follow-feed history limit: backfill from any date (down to each creator's very first post), incremental updates, resumable scans, auto-backfill for newly followed creators, JSON export/import for migration.
 // @author       dnasdw
@@ -52,10 +52,10 @@
         nav: 'https://api.bilibili.com/x/web-interface/nav',
         followings: (mid, pn) => `https://api.bilibili.com/x/relation/followings?vmid=${mid}&pn=${pn}&ps=50&order=desc`,
         feedSpace: (mid, offset) => `https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space?host_mid=${mid}&offset=${encodeURIComponent(offset)}&platform=web&features=itemOpusStyle`,
-        feedPgc: (offset) => `https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all?type=pgc&offset=${encodeURIComponent(offset)}&platform=web&features=itemOpusStyle`,
         collectedList: (mid, pn) => `https://api.bilibili.com/x/v3/fav/folder/collected/list?up_mid=${mid}&pn=${pn}&ps=20&platform=web`,
         seasonArchives: (mid, seasonId, pn) => `https://api.bilibili.com/x/polymer/web-space/seasons_archives_list?mid=${mid}&season_id=${seasonId}&page_num=${pn}&page_size=30&sort_reverse=false`,
         bangumiFollow: (mid, type, pn) => `https://api.bilibili.com/x/space/bangumi/follow/list?vmid=${mid}&type=${type}&pn=${pn}&ps=30`,
+        pgcSeason: (seasonId) => `https://api.bilibili.com/pgc/view/web/season?season_id=${seasonId}`,
     };
 
     // ============================ Pure core (testable, no DOM / no GM) ============================
@@ -209,68 +209,46 @@
             return lastScanTs || globalFloorTs;
         },
 
-        /**
-         * Parse one feed/all?type=pgc page (bangumi/drama updates from the follow
-         * feed; subject to the ~75-day window inherent to that feed).
-         * Real-world items come as DYNAMIC_TYPE_PGC or DYNAMIC_TYPE_PGC_UNION;
-         * pgc.title already carries "show: episode" text; the playable link is
-         * pgc.jump_url; pgc.badge.text carries the official category label.
-         * PGC items have no bvid - a stable pseudo id "ep{epid}" is used so they
-         * fit the same dedup/table machinery as regular videos.
-         * Returns { videos, ups, oldestTs, hasMore, offset }.
+                /**
+         * Parse a pgc/view/web/season response into full episode records.
+         * This is the unlimited-history source for the bangumi tab: every
+         * followed season is fetched once per scan and ALL its episodes are
+         * merged (id-deduped), so new follows are backfilled automatically.
+         * Entries keep the "ep{epid}" pseudo id used by the legacy feed source.
          */
-        parsePgcPage(json, sinceTs) {
-            const data = (json && json.data) || {};
-            const items = data.items || [];
+        parsePgcSeason(json) {
+            const r = (json && json.result) || {};
+            const episodes = r.episodes || [];
+            const TYPE_NAMES = { 1: '番剧', 2: '电影', 3: '纪录片', 4: '国创', 5: '电视剧', 7: '综艺' };
+            const typeName = TYPE_NAMES[Number(r.type)] || '剧集';
             const videos = [];
-            const ups = {};
-            let oldestTs = Infinity;
 
-            for (const item of items) {
-                const mods = item.modules || {};
-                const author = mods.module_author || {};
-                const major = (mods.module_dynamic || {}).major;
-                const ts = Number(author.pub_ts) || 0;
-                if (ts && ts < oldestTs) oldestTs = ts;
-
-                if (item.type !== 'DYNAMIC_TYPE_PGC' && item.type !== 'DYNAMIC_TYPE_PGC_UNION') continue;
-                const pgc = major && major.pgc;
-                if (!pgc || ts < sinceTs) continue;
-
-                const epid = Number(pgc.epid) || 0;
-                if (!epid) continue;
-                const upMid = String(author.mid || '');
-                if (upMid && !ups[upMid]) {
-                    ups[upMid] = {
-                        name: author.name || '',
-                        face: String(author.face || '').replace(/^http:\/\//, 'https://'),
-                    };
-                }
+            for (const ep of episodes) {
+                const epid = Number(ep.id) || 0;
+                const ts = Number(ep.pub_time) || 0;
+                if (!epid || !ts) continue;
+                // build "show episode-title long-title", dropping consecutive duplicate parts
+                const parts = [r.title, ep.title, ep.long_title].filter(Boolean);
+                const title = parts.filter((p, i) => p !== parts[i - 1]).join(' ');
                 videos.push({
                     bvid: 'ep' + epid,
-                    title: pgc.title || '(剧集更新)',
+                    title: title || '(剧集)',
                     pubTs: ts,
-                    upMid,
+                    upMid: '',
                     duration: '',
-                    badge: (pgc.badge && pgc.badge.text) || '追番',
-                    cover: String(pgc.cover || '').replace(/^http:\/\//, 'https://'),
-                    url: String(pgc.jump_url || pgc.url || '').replace(/^\/\//, 'https://')
+                    badge: typeName,
+                    cover: String(ep.cover || '').replace(/^http:\/\//, 'https://'),
+                    url: String(ep.link || ep.share_url || '').replace(/^\/\//, 'https://')
                         || ('https://www.bilibili.com/bangumi/play/ep' + epid),
-                    seasonId: String(pgc.season_id || ''),
+                    seasonId: String(r.season_id || ''),
+                    seasonName: r.title || '',
                     sources: ['pgc'],
                 });
             }
 
-            return {
-                videos,
-                ups,
-                oldestTs: oldestTs === Infinity ? 0 : oldestTs,
-                hasMore: Boolean(data.has_more),
-                offset: typeof data.offset === 'string' ? data.offset : '',
-            };
+            return { videos, seasonId: String(r.season_id || ''), title: r.title || '' };
         },
-
-        /**
+/**
          * Parse one seasons_archives_list page (episodes of a subscribed collection).
          * Returns { videos, ups, meta, hasMore, pageNum } - meta carries season info.
          */
@@ -941,42 +919,37 @@
         },
 
         /** Enumerate the user's bangumi/drama follow list (type 1 + 2 merged).
-         *  Returns a Set of season_ids, or null when the list could not be fetched. */
-        async getBangumiSeasons(myMid) {
-            const seasons = new Set();
+         *  Returns { follows: [{seasonId, title}], liveSet } for queueing + cleanup,
+         *  or null when the list could not be fetched (cleanup is then skipped). */
+        async getBangumiFollows(myMid) {
+            const follows = [];
+            const liveSet = new Set();
             try {
                 for (const type of [1, 2]) {
                     let pn = 1;
                     for (;;) {
                         const json = await apiGet(API.bangumiFollow(myMid, type, pn), `https://space.bilibili.com/${myMid}/bangumi`);
                         const page = Core.parseBangumiFollowList(json);
-                        for (const sid of page.list) seasons.add(sid);
+                        for (const it of page.list) {
+                            if (!liveSet.has(it)) { liveSet.add(it); follows.push({ seasonId: it }); }
+                        }
                         if (!page.hasNext || !page.list.length || pn >= 30) break;
                         pn++;
                     }
                 }
-                return seasons;
+                return { follows, liveSet };
             } catch (e) {
-                UI.log(`追番追剧列表获取失败(${e.message})，本次跳过对应清理`, 'warn');
+                UI.log(`追番追剧列表获取失败(${e.message})，本次跳过对应内容`, 'warn');
                 return null;
             }
         },
 
-        /** Scan bangumi/drama updates from the follow feed (type=pgc, ~75-day window). */
-        async scanPgc(sinceTs, state) {
-            let offset = '';
-            let found = 0;
-            for (let i = 0; i < 30; i++) {
-                const json = await apiGet(API.feedPgc(offset), 'https://t.bilibili.com/');
-                const page = Core.parsePgcPage(json, sinceTs);
-                found += Core.mergeVideos(state.videos, page.videos);
-                Core.mergeUps(state.ups, page.ups);
-                if (page.oldestTs > 0) {
-                    UI.progressSub(`追番追剧 · 第${i + 1}页 · 已扫到 ${Core.fmtDateTime(page.oldestTs)} · 累计+${found}`);
-                }
-                if (Core.shouldStopPaging(page, sinceTs)) return found;
-                offset = page.offset;
-            }
+        /** Fetch one followed season's full episode list (single request, no window limit). */
+        async scanBangumi(entry, state) {
+            const json = await apiGet(API.pgcSeason(entry.seasonId), 'https://space.bilibili.com/');
+            const page = Core.parsePgcSeason(json);
+            const found = Core.mergeVideos(state.videos, page.videos);
+            UI.progressSub(`${page.title || entry.seasonId} · ${page.videos.length} 集 · +${found}`);
             return found;
         },
 
@@ -1018,12 +991,15 @@
                     const followings = await this.getFollowings(myMid);
                     UI.log('正在枚举"我追的"订阅合集...');
                     const collectedSeasons = await this.getCollectedSeasons(myMid);
+                    UI.log('正在枚举追番追剧列表...');
+                    const bangumi = await this.getBangumiFollows(myMid);
+                    const bangumiFollows = bangumi ? bangumi.follows : [];
+                    const liveBangumi = bangumi ? bangumi.liveSet : null;
 
                     if (mode === 'increment') {
                         // apply unfollow/unsubscribe/un-bangumi cleanup according to settings
                         const liveFollows = new Set(followings.map((u) => u.mid));
                         const liveSeasons = new Set(collectedSeasons.map((s) => s.seasonId));
-                        const liveBangumi = await this.getBangumiSeasons(myMid);
                         const pr = Core.pruneSources(state, liveFollows, liveSeasons, liveBangumi, state.settings);
                         if (pr.removedVideos || pr.untagged) {
                             UI.log(`取关/退订清理：删除 ${pr.removedVideos} 条记录，${pr.untagged} 条移出对应分类`);
@@ -1036,6 +1012,7 @@
                         queue: [
                             ...followings.map((u) => ({ kind: 'up', mid: u.mid, name: u.uname })),
                             ...collectedSeasons.map((s) => ({ kind: 'season', seasonId: s.seasonId, mid: s.mid, name: s.title })),
+                            ...bangumiFollows.map((b) => ({ kind: 'bangumi', seasonId: b.seasonId, name: `追番 ${b.seasonId}` })),
                         ],
                         done: 0,
                         errors: [],
@@ -1043,9 +1020,9 @@
                     };
                     Store.save(state);
                     if (mode === 'full') {
-                        UI.log(`共 ${followings.length} 个关注 + ${collectedSeasons.length} 个订阅合集，起始日期 ${Core.fmtDate(sinceTs)}`);
+                        UI.log(`共 ${followings.length} 个关注 + ${collectedSeasons.length} 个订阅合集 + ${bangumiFollows.length} 部追番追剧，起始日期 ${Core.fmtDate(sinceTs)}`);
                     } else {
-                        UI.log(`共 ${followings.length} 个关注 + ${collectedSeasons.length} 个订阅合集，增量更新（新关注/新订阅将自动补全历史）`);
+                        UI.log(`共 ${followings.length} 个关注 + ${collectedSeasons.length} 个订阅合集 + ${bangumiFollows.length} 部追番追剧，增量更新（新关注/新订阅将自动补全历史）`);
                     }
                 }
 
@@ -1061,6 +1038,8 @@
                                 ? ((state.seasons[entry.seasonId] && state.seasons[entry.seasonId].lastTs) || state.globalFloorTs)
                                 : sinceTs;
                             found = await this.scanSeason(entry, seasonSince, state);
+                        } else if (entry.kind === 'bangumi') {
+                            found = await this.scanBangumi(entry, state);
                         } else {
                             const upSince = (scan.mode === 'increment')
                                 ? Core.incSinceTs(state.ups[entry.mid], state.globalFloorTs, state.lastScanTs)
@@ -1078,23 +1057,9 @@
                     Store.save(state); // persist after every entry for resumability
                 }
 
-                // bangumi/drama updates: ALWAYS pull the whole ~75-day window and
-                // dedup by id. The feed is short and low-volume, so this is cheap,
-                // and it makes the source immune to timestamp gaps (e.g. a past
-                // scan with a broken parser advancing lastScanTs while collecting
-                // nothing - that window is recovered automatically on every run).
-                try {
-                    const pgcSince = 0;
-                    console.log('[bfua] pgc phase start (full window)');
-                    const pgcFound = await this.scanPgc(pgcSince, state);
-                    console.log('[bfua] pgc phase done, found =', pgcFound);
-                    UI.log(`追番追剧: +${pgcFound} 条`);
-                } catch (e) {
-                    console.log('[bfua] pgc phase error', e);
-                    if (e.code === -101 || e.code === -100) throw e;
-                    scan.errors.push({ mid: 'pgc', uname: '追番追剧', msg: e.message });
-                    UI.log(`追番追剧: 失败 ${e.message}`, 'error');
-                }
+                // bangumi entries are scanned inside the queue above (kind='bangumi');
+                // each followed season is fetched whole on every run, so nothing
+                // extra to do here.
 
                 state.lastScanTs = scan.startedAt;
                 if (scan.mode === 'full') {

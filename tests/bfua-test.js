@@ -267,51 +267,34 @@ assertEq(Core.pageForAnchor([], 'v1', 20), 1, 'empty list -> page 1');
 // ---- v2: sources/seasons/pgc/tabs/prune ----
 console.log('\n# v2.0 features');
 
-// parsePgcPage (fields verified against a real DYNAMIC_TYPE_PGC_UNION response)
-const pgcJson = {
-    data: {
-        has_more: true, offset: '555',
-        items: [
-            {
-                type: 'DYNAMIC_TYPE_PGC_UNION',
-                modules: {
-                    module_author: { mid: 928123, name: '番剧出差', face: 'http://i0.hdslb.com/face/x.jpg', pub_ts: 1750000000 },
-                    module_dynamic: { major: { pgc: {
-                        type: 2, sub_type: '0', season_id: '26421', epid: '6497987',
-                        title: '这就是中国：第350集 沙漠绿色奇迹',
-                        cover: 'http://i0.hdslb.com/bfs/archive/765d26898e7a3395222be3aa5c068c521000d60f.jpg',
-                        badge: { text: '纪录片' },
-                        jump_url: 'https://www.bilibili.com/bangumi/play/ep6497987',
-                    } } },
-                },
-            },
-            {
-                type: 'DYNAMIC_TYPE_PGC',
-                modules: {
-                    module_author: { mid: 928123, name: '番剧出差', face: '', pub_ts: 1740000000 },
-                    module_dynamic: { major: { pgc: {
-                        season_id: '778', epid: '999999',
-                        title: '某番剧 第2话', cover: '',
-                        jump_url: '//www.bilibili.com/bangumi/play/ep999999',
-                        season_type: 1,
-                    } } },
-                },
-            },
-            { type: 'DYNAMIC_TYPE_AV', modules: { module_author: { mid: 1, pub_ts: 1750000100 }, module_dynamic: { major: { archive: { bvid: 'BVx' } } } } },
+// parsePgcSeason (unlimited-history source: pgc/view/web/season)
+const seasonDetail = {
+    result: {
+        season_id: 26421, title: '这就是中国', type: 3, cover: 'http://i0.hdslb.com/x.jpg',
+        episodes: [
+            { id: 6497987, title: '第350集', long_title: '沙漠绿色奇迹', cover: 'http://i0.hdslb.com/ep350.jpg', pub_time: 1750000000, link: 'https://www.bilibili.com/bangumi/play/ep6497987' },
+            { id: 6497000, title: '第350集', long_title: '', cover: 'http://i0.hdslb.com/ep349.jpg', pub_time: 1749000000, link: '//www.bilibili.com/bangumi/play/ep6497000' },
+            { id: 0, title: 'broken', pub_time: 100, link: '' },
+            { id: 111, title: 'noTs', pub_time: 0, link: '' },
         ],
     },
 };
-const pgcPage = Core.parsePgcPage(pgcJson, 0);
-assertEq(pgcPage.videos.length, 2, 'pgc/union items collected, AV item skipped');
-assertEq(pgcPage.videos[0].bvid, 'ep6497987', 'pseudo bvid ep{id}');
-assertEq(pgcPage.videos[0].badge, '纪录片', 'official badge text used');
-assertEq(pgcPage.videos[1].badge, '追番', 'badge fallback when missing');
-assertEq(pgcPage.videos[0].title, '这就是中国：第350集 沙漠绿色奇迹', 'title carries show+episode');
-assertEq(pgcPage.videos[0].url, 'https://www.bilibili.com/bangumi/play/ep6497987', 'jump_url used as link');
-assertEq(pgcPage.videos[1].url, 'https://www.bilibili.com/bangumi/play/ep999999', 'protocol-relative jump_url fixed');
-assertEq(pgcPage.videos[0].sources, ['pgc'], 'pgc sources');
-assertEq(pgcPage.ups['928123'].face, 'https://i0.hdslb.com/face/x.jpg', 'pgc author face http->https');
-assertEq(Core.parsePgcPage(pgcJson, 1745000000).videos.length, 1, 'sinceTs filters old pgc items');
+const sp = Core.parsePgcSeason(seasonDetail);
+assertEq(sp.videos.length, 2, 'broken episodes skipped');
+assertEq(sp.videos[0].bvid, 'ep6497987', 'pseudo id ep{epid} kept (legacy-compatible)');
+assertEq(sp.videos[0].title, '这就是中国 第350集 沙漠绿色奇迹', 'title = show + ep + long_title');
+assertEq(sp.videos[1].title, '这就是中国 第350集', 'empty long_title omitted');
+assertEq(sp.videos[0].badge, '纪录片', 'type 3 -> 纪录片');
+assertEq(sp.videos[0].seasonName, '这就是中国', 'seasonName for line-1 display');
+assertEq(sp.videos[0].seasonId, '26421', 'seasonId recorded');
+assertEq(sp.videos[0].cover, 'https://i0.hdslb.com/ep350.jpg', 'cover http->https');
+assertEq(sp.videos[1].url, 'https://www.bilibili.com/bangumi/play/ep6497000', 'protocol-relative link fixed');
+assertEq(sp.videos[0].sources, ['pgc'], 'pgc sources');
+assertEq(sp.videos[0].upMid, '', 'no author for season-sourced entries');
+// fallback url when link/share_url missing
+const sp2 = Core.parsePgcSeason({ result: { season_id: 1, title: 'X', type: 5, episodes: [{ id: 9, title: '第1集', long_title: 'Y', pub_time: 5 }] } });
+assertEq(sp2.videos[0].url, 'https://www.bilibili.com/bangumi/play/ep9', 'url fallback to ep page');
+assertEq(sp2.videos[0].badge, '电视剧', 'type 5 -> 电视剧');
 
 // parseSeasonPage
 const seasonJson = {
@@ -418,9 +401,8 @@ assertEq(bfPage.list, ['111', '222'], 'season ids stringified, broken filtered')
 assertEq(bfPage.total, 3, 'total passthrough');
 assertEq(bfPage.hasNext, true, 'has_next passthrough');
 
-// parsePgcPage records seasonId (needed for un-bangumi cleanup)
-assertEq(pgcPage.videos[0].seasonId, '26421', 'pgc seasonId recorded');
-assertEq(pgcPage.videos[1].seasonId, '778', 'second pgc seasonId');
+// parsePgcSeason records seasonId (needed for un-bangumi cleanup)
+assertEq(sp.videos[0].seasonId, '26421', 'pgc seasonId recorded');
 
 // pruneSources: pgc dimension (new signature with liveBangumi)
 const pstateB = {
