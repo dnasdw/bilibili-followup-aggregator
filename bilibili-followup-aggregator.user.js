@@ -2,7 +2,7 @@
 // @name         B站关注动态聚合器 - 视频补课与增量归档
 // @name:en      Bilibili Follow Feed Aggregator - Video Backfill & Incremental Archive
 // @namespace    https://github.com/dnasdw
-// @version      2.2.0
+// @version      2.3.0
 // @description  聚合全部关注UP主的视频动态（正式投稿+动态视频），按发布时间重建完整时间线。绕过B站关注动态页只能回看约75天历史的限制：支持从任意日期回溯补课（可扫到每个UP的第一条动态）、增量归档、断点续扫、新关注UP自动补全、多设备迁移
 // @description:en  Aggregate video dynamics (uploads + dynamic videos) from all followed creators into one timeline. Bypasses bilibili's ~75-day follow-feed history limit: backfill from any date (down to each creator's very first post), incremental updates, resumable scans, auto-backfill for newly followed creators, JSON export/import for migration.
 // @author       dnasdw
@@ -45,6 +45,7 @@
         maxRetries: 4,
         requestTimeoutMs: 20000,
         maxPagesPerUp: 500,          // hard safety cap
+        workerCount: 3,             // concurrent scan workers (global throttle still applies)
         listPageSize: 20,            // UI list page size (card layout)
     };
 
@@ -725,11 +726,19 @@
         },
     };
 
+    /**
+     * Slot-claiming throttle: safe under concurrency. Each caller atomically
+     * claims the next free time slot, THEN sleeps until it. No matter how many
+     * workers run in parallel, the global request pace stays one request per
+     * reqDelayMin..Max ms - parallelism only overlaps network round-trips.
+     */
     async function throttle() {
         const now = Date.now();
-        const wait = lastRequestAt + CONFIG.reqDelayMinMs + Math.random() * (CONFIG.reqDelayMaxMs - CONFIG.reqDelayMinMs) - now;
+        const delay = CONFIG.reqDelayMinMs + Math.random() * (CONFIG.reqDelayMaxMs - CONFIG.reqDelayMinMs);
+        const slotAt = Math.max(now, lastRequestAt + delay);
+        lastRequestAt = slotAt; // claim the slot immediately (atomic on the JS thread)
+        const wait = slotAt - now;
         if (wait > 0) await Sleeper.sleep(wait);
-        lastRequestAt = Date.now();
     }
 
     /**
@@ -1027,35 +1036,43 @@
                 }
 
                 const scan = state.scan;
-                while (scan.queue.length > 0) {
-                    if (this.stopFlag) { UI.log('扫描已暂停，可稍后"继续未完成的扫描"', 'warn'); Store.save(state); return; }
-                    const entry = scan.queue[0];
-                    UI.progress(scan.done, scan.done + scan.queue.length, entry.name || entry.mid);
-                    try {
-                        let found = 0;
-                        if (entry.kind === 'season') {
-                            const seasonSince = (scan.mode === 'increment')
-                                ? ((state.seasons[entry.seasonId] && state.seasons[entry.seasonId].lastTs) || state.globalFloorTs)
-                                : sinceTs;
-                            found = await this.scanSeason(entry, seasonSince, state);
-                        } else if (entry.kind === 'bangumi') {
-                            found = await this.scanBangumi(entry, state);
-                        } else {
-                            const upSince = (scan.mode === 'increment')
-                                ? Core.incSinceTs(state.ups[entry.mid], state.globalFloorTs, state.lastScanTs)
-                                : sinceTs;
-                            found = await this.scanUp(entry, upSince, state);
+                const total = scan.queue.length;
+                const workerBody = async () => {
+                    for (;;) {
+                        if (this.stopFlag) return;
+                        const entry = scan.queue.shift();
+                        if (!entry) return;
+                        UI.progress(scan.done, total, entry.name || entry.mid);
+                        try {
+                            let found = 0;
+                            if (entry.kind === 'season') {
+                                const seasonSince = (scan.mode === 'increment')
+                                    ? ((state.seasons[entry.seasonId] && state.seasons[entry.seasonId].lastTs) || state.globalFloorTs)
+                                    : sinceTs;
+                                found = await this.scanSeason(entry, seasonSince, state);
+                            } else if (entry.kind === 'bangumi') {
+                                found = await this.scanBangumi(entry, state);
+                            } else {
+                                const upSince = (scan.mode === 'increment')
+                                    ? Core.incSinceTs(state.ups[entry.mid], state.globalFloorTs, state.lastScanTs)
+                                    : sinceTs;
+                                found = await this.scanUp(entry, upSince, state);
+                            }
+                            UI.log(`${entry.name || entry.mid}: +${found} 条`);
+                        } catch (e) {
+                            if (e.code === -100) { scan.queue.unshift(entry); return; } // stopped mid-entry: put it back
+                            if (e.code === -101) throw e; // fatal: not logged in
+                            scan.errors.push({ mid: entry.mid || entry.seasonId, uname: entry.name || '', msg: e.message });
+                            UI.log(`${entry.name || entry.mid}: 失败 ${e.message}`, 'error');
                         }
-                        UI.log(`${entry.name || entry.mid}: +${found} 条`);
-                    } catch (e) {
-                        if (e.code === -101 || e.code === -100) throw e; // fatal: not logged in / user stopped
-                        scan.errors.push({ mid: entry.mid || entry.seasonId, uname: entry.name || '', msg: e.message });
-                        UI.log(`${entry.name || entry.mid}: 失败 ${e.message}`, 'error');
+                        scan.done++;
+                        Store.save(state); // persist after every entry for resumability
                     }
-                    scan.queue.shift();
-                    scan.done++;
-                    Store.save(state); // persist after every entry for resumability
-                }
+                };
+                const workers = [];
+                for (let w = 0; w < CONFIG.workerCount; w++) workers.push(workerBody());
+                await Promise.all(workers);
+                if (this.stopFlag) { UI.log('扫描已暂停，可稍后"继续未完成的扫描"', 'warn'); Store.save(state); return; }
 
                 // bangumi entries are scanned inside the queue above (kind='bangumi');
                 // each followed season is fetched whole on every run, so nothing
