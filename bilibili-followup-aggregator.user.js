@@ -2,9 +2,9 @@
 // @name         B站关注动态聚合器 - 视频补课与增量归档
 // @name:en      Bilibili Follow Feed Aggregator - Video Backfill & Incremental Archive
 // @namespace    https://github.com/dnasdw
-// @version      2.6.3
-// @description  聚合全部关注UP主的视频动态（正式投稿+动态视频），按发布时间重建完整时间线。绕过B站关注动态页只能回看约75天历史的限制：支持从任意日期回溯补课（可扫到每个UP的第一条动态）、增量归档、断点续扫、新关注UP自动补全、多设备迁移
-// @description:en  Aggregate video dynamics (uploads + dynamic videos) from all followed creators into one timeline. Bypasses bilibili's ~75-day follow-feed history limit: backfill from any date (down to each creator's very first post), incremental updates, resumable scans, auto-backfill for newly followed creators, JSON export/import for migration.
+// @version      2.7.0
+// @description  聚合全部关注UP主的视频动态（正式投稿+动态视频），按发布时间重建完整时间线。绕过B站关注动态页只能回看约75天历史的限制：支持从任意日期回溯补课（可扫到每个UP的第一条动态）、增量归档、断点续扫、新关注UP自动补全；追番追剧与订阅合集同步入库；联合投稿自动识别主UP主；多设备迁移
+// @description:en  Aggregate video dynamics (uploads + dynamic videos) from all followed creators into one timeline. Bypasses bilibili's ~75-day follow-feed history limit: backfill from any date (down to each creator's very first post), incremental updates, resumable scans, auto-backfill for newly followed creators; bangumi/drama and subscribed seasons synced in; joint uploads attributed to the primary uploader; JSON export/import for migration.
 // @author       dnasdw
 // @match        https://t.bilibili.com/*
 // @grant        GM_xmlhttpRequest
@@ -25,10 +25,18 @@
  * which never appear in the upload list). Both share type DYNAMIC_TYPE_AV /
  * major.archive with a normal bvid playable at www.bilibili.com/video/{bvid}.
  *
- * Endpoints used (all cookie-based, no wbi signature required):
- *   GET /x/web-interface/nav                                   -> my mid / login state
- *   GET /x/relation/followings?vmid=&pn=&ps=50&order=desc      -> followings list
- *   GET /x/polymer/web-dynamic/v1/feed/space?host_mid=&offset= -> per-UP dynamics
+ * Endpoints used (cookie-based login; wbi-signed, except nav):
+ *   GET /x/web-interface/nav                                        -> my mid / login state / wbi keys
+ *   GET /x/relation/followings?vmid=&pn=&ps=50&order=desc           -> followings list
+ *   GET /x/polymer/web-dynamic/v1/feed/space?host_mid=&offset=      -> per-UP dynamics (no history limit)
+ *   GET /x/v3/fav/folder/collected/list?up_mid=                     -> "subscribed" list (seasons + folders mixed)
+ *   GET /x/polymer/web-space/seasons_archives_list?mid=&season_id=  -> season episode list (probe + paging)
+ *   GET /x/space/bangumi/follow/list?vmid=&type=                    -> followed bangumi/drama list
+ *   GET /pgc/view/web/season?season_id=                             -> full episode list per followed season
+ *   GET /x/web-interface/view?bvid=                                 -> joint-upload owner settlement
+ *                                                                     (only for videos seen in 2+ UPs'
+ *                                                                     feeds; owner.mid = the true
+ *                                                                     uploader, staff[] = roster)
  */
 
 (function () {
@@ -53,6 +61,7 @@
         nav: 'https://api.bilibili.com/x/web-interface/nav',
         followings: (mid, pn) => `https://api.bilibili.com/x/relation/followings?vmid=${mid}&pn=${pn}&ps=50&order=desc`,
         feedSpace: (mid, offset) => `https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space?host_mid=${mid}&offset=${encodeURIComponent(offset)}&platform=web&features=itemOpusStyle`,
+        videoView: (bvid) => `https://api.bilibili.com/x/web-interface/view?bvid=${bvid}`,
         collectedList: (mid, pn) => `https://api.bilibili.com/x/v3/fav/folder/collected/list?up_mid=${mid}&pn=${pn}&ps=20&platform=web`,
         seasonArchives: (mid, seasonId, pn) => `https://api.bilibili.com/x/polymer/web-space/seasons_archives_list?mid=${mid}&season_id=${seasonId}&page_num=${pn}&page_size=30&sort_reverse=false`,
         bangumiFollow: (mid, type, pn) => `https://api.bilibili.com/x/space/bangumi/follow/list?vmid=${mid}&type=${type}&pn=${pn}&ps=30`,
@@ -148,9 +157,17 @@
 
         /** Merge videos into an id-keyed map. New ids are added; existing entries
          *  get missing fields backfilled and sources unioned (a video can be both
-         *  an upload dynamic from a followed UP and an episode of a subscribed season). */
+         *  an upload dynamic from a followed UP and an episode of a subscribed season).
+         *  Joint uploads: the same video legitimately appears in EVERY staff
+         *  member's space feed, so a second sighting with a DIFFERENT upMid means
+         *  attribution is ambiguous (whoever was scanned first won). Such entries
+         *  are reported in `conflicts` so the scanner can settle them via the
+         *  video-detail API; entries already marked ownerVerified are settled
+         *  and never re-reported.
+         *  Returns { added, conflicts: [{ bvid, mids }] }. */
         mergeVideos(map, videos) {
             let added = 0;
+            const conflicts = [];
             for (const v of videos) {
                 const ex = map[v.bvid];
                 if (!ex) { map[v.bvid] = v; added++; }
@@ -162,12 +179,63 @@
                     // unsubscribe cleanup can judge them accurately
                     if (!ex.seasonId && v.seasonId) ex.seasonId = v.seasonId;
                     if (!ex.seasonName && v.seasonName) ex.seasonName = v.seasonName;
+                    if (!ex.ownerVerified && v.upMid && ex.upMid && v.upMid !== ex.upMid) {
+                        conflicts.push({ bvid: ex.bvid, mids: [ex.upMid, v.upMid] });
+                    }
                     for (const s of v.sources || []) {
                         if (ex.sources.indexOf(s) === -1) ex.sources.push(s);
                     }
                 }
             }
-            return added;
+            return { added, conflicts };
+        },
+
+        /** Parse a web-interface/view response: the authoritative owner (the
+         *  publishing account) of a video plus its joint-upload staff roster.
+         *  For joint uploads owner.mid is the primary uploader, and staff[]
+         *  lists every member with the owner titled 'UP主' and collaborators
+         *  titled by their role ('曲绘', '出演', ...). Non-cooperation videos
+         *  have no staff array. */
+        parseVideoView(json) {
+            const d = (json && json.data) || {};
+            const owner = d.owner || {};
+            const staff = (Array.isArray(d.staff) ? d.staff : [])
+                .map((s) => ({ mid: String(s.mid || ''), name: s.name || '', title: s.title || '' }))
+                .filter((s) => s.mid);
+            return {
+                bvid: String(d.bvid || ''),
+                ownerMid: String(owner.mid || ''),
+                ownerName: owner.name || '',
+                ownerFace: String(owner.face || '').replace(/^http:\/\//, 'https://'),
+                staff,
+            };
+        },
+
+        /** Settle a conflicted joint-upload entry: re-attribute it to the true
+         *  owner, store the staff roster, and mark it ownerVerified so later
+         *  merges from other collaborators' feeds never re-trigger the lookup.
+         *  The owner is added to the ups table when missing (card display).
+         *  Returns true when the record was updated. */
+        applyCoopOwner(state, info) {
+            const v = state.videos[info.bvid];
+            if (!v || !info.ownerMid) return false;
+            v.upMid = info.ownerMid;
+            if (info.staff.length > 1) v.staff = info.staff;
+            v.ownerVerified = true;
+            if (!state.ups[info.ownerMid]) {
+                state.ups[info.ownerMid] = { mid: info.ownerMid, name: info.ownerName || '', face: info.ownerFace || '' };
+            }
+            return true;
+        },
+
+        /** True when any staff member other than the attributed owner is still
+         *  in the live follow list - the entry must survive the unfollow cleanup. */
+        hasLiveCooperator(v, liveFollows) {
+            const staff = v.staff || [];
+            for (const s of staff) {
+                if (s.mid && s.mid !== v.upMid && liveFollows.has(s.mid)) return true;
+            }
+            return false;
         },
 
         /** Merge per-UP info table; refreshes name/avatar on re-scan (UPs can rename). */
@@ -362,7 +430,7 @@
             if (unfollow) {
                 for (const v of Object.values(state.videos)) {
                     const i = (v.sources || []).indexOf('follow');
-                    if (i !== -1 && !liveFollows.has(v.upMid)) {
+                    if (i !== -1 && !liveFollows.has(v.upMid) && !Core.hasLiveCooperator(v, liveFollows)) {
                         v.sources.splice(i, 1);
                         untagged++;
                         if (!v.sources.length) { delete state.videos[v.bvid]; removedVideos++; }
@@ -958,6 +1026,25 @@
             state.ups[mid].lastTs = ts;
         },
 
+        /** Settle a joint-upload attribution conflict via the video-detail API:
+         *  the entry is re-attributed to its true owner (the publishing
+         *  account) and the staff roster is recorded. Failure is non-fatal -
+         *  the current attribution stays and the conflict re-surfaces (and is
+         *  retried) on a future scan, since ownerVerified is only set on
+         *  success. */
+        async resolveCoopOwner(state, bvid) {
+            const v = state.videos[bvid];
+            if (!v || v.ownerVerified) return;
+            try {
+                const json = await apiGet(API.videoView(bvid), 'https://www.bilibili.com/video/' + bvid);
+                Core.applyCoopOwner(state, Core.parseVideoView(json));
+                UI.log(`合作视频 ${bvid} 归属已修正为主UP（${state.ups[v.upMid] && state.ups[v.upMid].name || v.upMid}）`);
+            } catch (e) {
+                if (e.code === -100 || e.code === -101) throw e; // stopped / not logged in
+                UI.log(`合作视频 ${bvid} 主UP识别失败(${e.message})，暂保留现有归属，下次扫描自动重试`, 'warn');
+            }
+        },
+
         /** Scan a single UP until dynamics older than sinceTs. Throws on persistent failure. */
         async scanUp(up, sinceTs, state) {
             const t0 = Math.floor(Date.now() / 1000);
@@ -966,8 +1053,10 @@
             for (let i = 0; i < CONFIG.maxPagesPerUp; i++) {
                 const json = await apiGet(API.feedSpace(up.mid, offset), `https://space.bilibili.com/${up.mid}/dynamic`);
                 const page = Core.parseFeedPage(json, sinceTs);
-                found += Core.mergeVideos(state.videos, page.videos);
+                const merged = Core.mergeVideos(state.videos, page.videos);
+                found += merged.added;
                 Core.mergeUps(state.ups, page.ups);
+                for (const c of merged.conflicts) await this.resolveCoopOwner(state, c.bvid);
                 // inner progress: show which time point we have paged back to,
                 // so a long scan through a prolific UP never looks stuck
                 if (page.oldestTs > 0) {
@@ -991,7 +1080,11 @@
             for (let pn = 1; pn <= 100; pn++) {
                 const json = await apiGet(API.seasonArchives(entry.mid, entry.seasonId, pn), 'https://space.bilibili.com/');
                 const page = Core.parseSeasonPage(json, sinceTs);
-                found += Core.mergeVideos(state.videos, page.videos);
+                const merged = Core.mergeVideos(state.videos, page.videos);
+                found += merged.added;
+                // seasons may include the owner's joint uploads; the season owner
+                // is then a collaborator, not the true owner -> settle conflicts too
+                for (const c of merged.conflicts) await this.resolveCoopOwner(state, c.bvid);
                 if (page.meta.seasonId) {
                     const s = state.seasons[page.meta.seasonId] = state.seasons[page.meta.seasonId]
                         || { seasonId: page.meta.seasonId, mid: page.meta.mid, title: page.meta.name, lastTs: 0 };
@@ -1036,9 +1129,10 @@
         async scanBangumi(entry, state) {
             const json = await apiGet(API.pgcSeason(entry.seasonId), 'https://space.bilibili.com/');
             const page = Core.parsePgcSeason(json);
-            const found = Core.mergeVideos(state.videos, page.videos);
-            UI.progressSub(`${page.title || entry.seasonId} · ${page.videos.length} 集 · +${found}`);
-            return found;
+            const merged = Core.mergeVideos(state.videos, page.videos);
+            for (const c of merged.conflicts) await this.resolveCoopOwner(state, c.bvid); // defensive: pgc lane has no upMid
+            UI.progressSub(`${page.title || entry.seasonId} · ${page.videos.length} 集 · +${merged.added}`);
+            return merged.added;
         },
 
         /**
@@ -1239,6 +1333,7 @@
 .bfua-face{width:22px;height:22px;border-radius:50%;object-fit:cover;background:#e3e5e7}
 .bfua-face-empty{width:22px;height:22px;border-radius:50%;background:#e3e5e7;flex:0 0 22px}
 .bfua-up{color:#00aeec;font-size:13px}
+.bfua-coop{color:#9499a0;font-size:11px;cursor:help;flex:0 0 auto}
 .bfua-badge-dyn{color:#ff7f24;border:1px solid #ffb27a;border-radius:4px;padding:0 4px;font-size:11px}
 .bfua-dur{color:#9499a0;font-size:12px;margin-left:auto;flex:0 0 auto}
 .bfua-title{font-size:13.5px;margin:3px 0;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
@@ -1322,7 +1417,7 @@
   <label><input type="checkbox" id="bfua-set-del-unsub"> 取消订阅合集时移除对应记录</label>
   <label><input type="checkbox" id="bfua-set-del-unfollow"> 取消关注UP主时移除对应记录</label>
   <label><input type="checkbox" id="bfua-set-del-bangumi"> 取消追番追剧时移除对应记录</label>
-  <div style="color:#9499a0;font-size:12px;line-height:1.6;margin:8px 0">说明：更改即时生效。默认分类标签页在页面加载时读取，修改后下次刷新页面生效。交叉来源的视频只会移出对应分类页，所有来源都移除后才删除本地记录。</div>
+  <div style="color:#9499a0;font-size:12px;line-height:1.6;margin:8px 0">说明：更改即时生效。默认分类标签页在页面加载时读取，修改后下次刷新页面生效。交叉来源的视频只会移出对应分类页，所有来源都移除后才删除本地记录；联合投稿只要主UP或任一合作者仍被关注即保留。</div>
 </div>
 `;
             document.body.appendChild(overlay);
@@ -1626,6 +1721,18 @@
                     }
                     const upNameEl = document.createElement('span'); upNameEl.className = 'bfua-up'; upNameEl.textContent = v.seasonName || up.name || v.upMid;
                     line1.appendChild(upNameEl);
+                    // joint upload: "+N" marker next to the owner, hover lists the
+                    // full staff roster with roles (owner titled UP主)
+                    if (Array.isArray(v.staff) && v.staff.length > 1) {
+                        const guests = v.staff.filter((s) => s.mid && s.mid !== v.upMid);
+                        if (guests.length) {
+                            const coop = document.createElement('span');
+                            coop.className = 'bfua-coop';
+                            coop.textContent = '合作 +' + guests.length;
+                            coop.title = '联合投稿：' + v.staff.map((s) => `${s.name}（${s.title || '合作'}）`).join('、');
+                            line1.appendChild(coop);
+                        }
+                    }
                     // highlight non-upload videos only (uploads are the common case -> keep quiet)
                     if (v.badge && v.badge !== '投稿视频') {
                         const badge = document.createElement('span');

@@ -126,14 +126,14 @@ assertEq(Core.shouldStopPaging({ hasMore: true, offset: 'x', oldestTs: 0 }, sinc
 // ---- mergeVideos ----
 console.log('\n# mergeVideos');
 const map = {};
-assertEq(Core.mergeVideos(map, [page.videos[0]]), 1, 'first insert counts');
-assertEq(Core.mergeVideos(map, [page.videos[0]]), 0, 'duplicate bvid not re-added');
+assertEq(Core.mergeVideos(map, [page.videos[0]]).added, 1, 'first insert counts');
+assertEq(Core.mergeVideos(map, [page.videos[0]]).added, 0, 'duplicate bvid not re-added');
 assertEq(Object.keys(map).length, 1, 'map size stable');
 // backfill: legacy entry (no cover) gets it from a newer scan
 const legacy = { bvid: 'BVold1', title: 'old', pubTs: 1, cover: '' };
 const newer = { bvid: 'BVold1', title: 'old', pubTs: 1, cover: 'https://x/cover.jpg' };
 Core.mergeVideos(map, [legacy]);
-assertEq(Core.mergeVideos(map, [newer]), 0, 'backfill does not count as new');
+assertEq(Core.mergeVideos(map, [newer]).added, 0, 'backfill does not count as new');
 assertEq(map.BVold1.cover, 'https://x/cover.jpg', 'cover backfilled on legacy entry');
 
 // ---- mergeUps ----
@@ -329,7 +329,7 @@ assertEq(colPage.list[0].id, '12345', 'id stringified');
 // mergeVideos: sources union
 const mv = {};
 Core.mergeVideos(mv, [{ bvid: 'BVx', title: 't', pubTs: 1, sources: ['follow'] }]);
-const addedX = Core.mergeVideos(mv, [{ bvid: 'BVx', title: 't', pubTs: 1, sources: ['season'], seasonId: '55', seasonName: '合集X' }]);
+const addedX = Core.mergeVideos(mv, [{ bvid: 'BVx', title: 't', pubTs: 1, sources: ['season'], seasonId: '55', seasonName: '合集X' }]).added;
 assertEq(addedX, 0, 'cross-source merge is not a new record');
 assertEq(mv.BVx.sources.slice().sort(), ['follow', 'season'], 'sources unioned');
 assertEq(mv.BVx.seasonId, '55', 'seasonId backfilled on cross-source entry');
@@ -437,6 +437,95 @@ assertEq(pstateC.videos.p2.bvid, 'p2', 'null bangumi list -> no pgc pruning');
 const pstateD = { videos: { p2: { bvid: 'p2', upMid: '9', seasonId: '222', sources: ['pgc'] } }, ups: {}, seasons: {} };
 Core.pruneSources(pstateD, new Set(['9']), new Set(), new Set(['111']), { delOnUnfollow: true, delOnUnsubscribe: true, delOnUnfollowBangumi: false });
 assertEq(pstateD.videos.p2.sources, ['pgc'], 'delOnUnfollowBangumi off -> pgc tag kept');
+
+// ---- v2.7: joint-upload attribution (联合投稿主UP识别) ----
+console.log('\n# v2.7 joint-upload attribution');
+
+// mergeVideos: same bvid from a DIFFERENT uploader's feed -> conflict reported
+const cmap = {};
+let cm1 = Core.mergeVideos(cmap, [{ bvid: 'BVcoop', title: 't', pubTs: 1, upMid: 'A', sources: ['follow'] }]);
+assertEq(cm1.added, 1, 'first sighting added');
+assertEq(cm1.conflicts, [], 'no conflict on first sighting');
+let cm2 = Core.mergeVideos(cmap, [{ bvid: 'BVcoop', title: 't', pubTs: 1, upMid: 'B', sources: ['follow'] }]);
+assertEq(cm2.added, 0, 'second sighting not re-added');
+assertEq(cm2.conflicts, [{ bvid: 'BVcoop', mids: ['A', 'B'] }], 'conflict reported with both mids');
+assertEq(cmap.BVcoop.upMid, 'A', 'attribution unchanged until resolved');
+// same-uploader re-merge never conflicts
+assertEq(Core.mergeVideos(cmap, [{ bvid: 'BVcoop', title: 't', pubTs: 1, upMid: 'A', sources: ['season'] }]).conflicts, [], 'same-uploader re-merge no conflict');
+// empty upMid (pgc lane) never conflicts
+assertEq(Core.mergeVideos(cmap, [{ bvid: 'BVcoop', title: 't', pubTs: 1, upMid: '', sources: ['pgc'] }]).conflicts, [], 'empty upMid never conflicts');
+// settled entries never re-conflict
+cmap.BVcoop.ownerVerified = true;
+assertEq(Core.mergeVideos(cmap, [{ bvid: 'BVcoop', title: 't', pubTs: 1, upMid: 'C', sources: ['follow'] }]).conflicts, [], 'ownerVerified entry never re-conflicts');
+assertEq(cmap.BVcoop.upMid, 'A', 'ownerVerified entry attribution untouched by later merges');
+
+// parseVideoView: owner = publishing account, staff roster with roles
+// (structure per bilibili-API-collect docs/video/info.md real sample)
+const viewJson = {
+    code: 0,
+    data: {
+        bvid: 'BVcoop',
+        owner: { mid: 66606350, name: '陈楒潼桶桶桶', face: 'http://i2.hdslb.com/bfs/face/x.jpg' },
+        rights: { is_cooperation: 1 },
+        staff: [
+            { mid: 66606350, title: 'UP主', name: '陈楒潼桶桶桶', face: 'http://i2.hdslb.com/bfs/face/x.jpg', follower: 616428 },
+            { mid: 53456, title: '曲绘', name: 'Warma', face: 'http://i2.hdslb.com/bfs/face/w.jpg', follower: 4818052 },
+        ],
+    },
+};
+const vi = Core.parseVideoView(viewJson);
+assertEq(vi.bvid, 'BVcoop', 'bvid passthrough');
+assertEq(vi.ownerMid, '66606350', 'owner mid stringified');
+assertEq(vi.ownerName, '陈楒潼桶桶桶', 'owner name');
+assertEq(vi.ownerFace, 'https://i2.hdslb.com/bfs/face/x.jpg', 'owner face http->https');
+assertEq(vi.staff, [
+    { mid: '66606350', name: '陈楒潼桶桶桶', title: 'UP主' },
+    { mid: '53456', name: 'Warma', title: '曲绘' },
+], 'staff roster slimmed to mid/name/title');
+// non-cooperation video: view response has no staff array
+assertEq(Core.parseVideoView({ data: { bvid: 'BV1', owner: { mid: 7, name: 'x' } } }).staff, [], 'no staff field -> empty roster');
+assertEq(Core.parseVideoView(null).ownerMid, '', 'null json tolerated');
+
+// applyCoopOwner: re-attribute to the true owner + record roster + mark verified
+const astate = {
+    videos: { BVcoop: { bvid: 'BVcoop', upMid: 'B', pubTs: 1, sources: ['follow'] } },
+    ups: { B: { mid: 'B', name: '合作者B', face: '' } },
+};
+assertEq(Core.applyCoopOwner(astate, vi), true, 'applyCoopOwner reports update');
+assertEq(astate.videos.BVcoop.upMid, '66606350', 'attribution moved to true owner');
+assertEq(astate.videos.BVcoop.ownerVerified, true, 'ownerVerified flag set');
+assertEq(astate.videos.BVcoop.staff.length, 2, 'staff roster stored on entry');
+assertEq(astate.ups['66606350'], { mid: '66606350', name: '陈楒潼桶桶桶', face: 'https://i2.hdslb.com/bfs/face/x.jpg' }, 'owner added to ups table for display');
+// idempotent re-apply
+assertEq(Core.applyCoopOwner(astate, vi), true, 're-apply still true');
+assertEq(astate.videos.BVcoop.upMid, '66606350', 'idempotent re-apply keeps owner');
+// guards
+assertEq(Core.applyCoopOwner(astate, { bvid: 'nope', ownerMid: '1' }), false, 'missing record -> false');
+assertEq(Core.applyCoopOwner(astate, { bvid: 'BVcoop', ownerMid: '' }), false, 'empty ownerMid -> false');
+// single-staff (owner only) response: attribution set, roster NOT stored
+const sstate = { videos: { BVsolo: { bvid: 'BVsolo', upMid: 'B', pubTs: 1, sources: ['follow'] } }, ups: {} };
+Core.applyCoopOwner(sstate, { bvid: 'BVsolo', ownerMid: '9', ownerName: 'z', ownerFace: '', staff: [] });
+assertEq(sstate.videos.BVsolo.upMid, '9', 'solo entry re-attributed');
+assertEq(sstate.videos.BVsolo.staff, undefined, 'solo entry stores no roster');
+
+// hasLiveCooperator
+assertEq(Core.hasLiveCooperator({ upMid: '1', staff: [{ mid: '1' }, { mid: '2' }] }, new Set(['2'])), true, 'live collaborator -> true');
+assertEq(Core.hasLiveCooperator({ upMid: '1', staff: [{ mid: '1' }, { mid: '2' }] }, new Set(['3'])), false, 'nobody live -> false');
+assertEq(Core.hasLiveCooperator({ upMid: '1' }, new Set(['1'])), false, 'no roster -> false');
+assertEq(Core.hasLiveCooperator({ upMid: '1', staff: [{ mid: '1', name: 'owner' }] }, new Set(['1'])), false, 'owner is not a collaborator');
+
+// pruneSources: joint upload kept alive by a still-followed collaborator
+const pstateCoop = {
+    videos: {
+        c1: { bvid: 'c1', upMid: '10', sources: ['follow'], staff: [{ mid: '10', name: '主UP', title: 'UP主' }, { mid: '20', name: '合作者', title: '曲绘' }] },
+        c2: { bvid: 'c2', upMid: '10', sources: ['follow'], staff: [{ mid: '10', name: '主UP', title: 'UP主' }, { mid: '30', name: '前合作者', title: '出演' }] },
+    },
+    ups: { '10': { mid: '10', lastTs: 5 } },
+    seasons: {},
+};
+Core.pruneSources(pstateCoop, new Set(['20']), null, null, { delOnUnfollow: true, delOnUnsubscribe: true, delOnUnfollowBangumi: true });
+assertEq(pstateCoop.videos.c1.sources, ['follow'], 'joint upload survives owner-unfollow via still-followed collaborator');
+assertEq(pstateCoop.videos.c2, undefined, 'all staff unfollowed -> joint upload removed');
 
 // ---- summary ----
 console.log(`\n${passed} passed, ${failed} failed`);
