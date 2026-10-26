@@ -527,6 +527,154 @@ Core.pruneSources(pstateCoop, new Set(['20']), null, null, { delOnUnfollow: true
 assertEq(pstateCoop.videos.c1.sources, ['follow'], 'joint upload survives owner-unfollow via still-followed collaborator');
 assertEq(pstateCoop.videos.c2, undefined, 'all staff unfollowed -> joint upload removed');
 
+// ---- v2.8: watch-history archiving (历史记录) ----
+console.log('\n# v2.8 watch history');
+
+// parseHistoryCursorPage: all business types map onto the record schema
+const histJson = {
+    code: 0,
+    data: {
+        cursor: { max: 497899395, view_at: 1588828357, business: 'archive', ps: 30 },
+        tab: [],
+        list: [
+            { // archive video: full data
+                title: '600元的iMac', long_title: '', cover: 'http://i0.hdslb.com/bfs/archive/f.jpg', covers: null, uri: '',
+                history: { oid: 497899395, epid: 0, bvid: 'BV1NK41157EF', page: 1, cid: 1, part: '', business: 'archive', dt: 2 },
+                videos: 1, author_name: '数字云糕', author_face: 'http://i2.hdslb.com/bfs/face/2.jpg', author_mid: 3391089,
+                view_at: 1588828357, progress: 277, badge: '', show_title: '', duration: 389, kid: 497899395,
+            },
+            { // pgc episode: pseudo id ep{epid}, no up, episode title appended
+                title: '百妖谱', long_title: '庆忌（下）', cover: 'http://i0.hdslb.com/bfs/archive/b.jpg', covers: null,
+                uri: 'https://www.bilibili.com/bangumi/play/ss26193',
+                history: { oid: 370908663, epid: 326789, bvid: '', page: 0, cid: 2, part: '', business: 'pgc', dt: 3 },
+                videos: 0, author_name: '', author_face: '', author_mid: 0,
+                view_at: 1588810000, progress: 533, badge: '国创', show_title: '第8话 庆忌（下）', duration: 1402, kid: 26193,
+            },
+            { // live: no duration/progress, url = live room
+                title: '从国际空间站俯瞰地球', long_title: '', cover: 'http://i0.hdslb.com/live/c.jpg', covers: null,
+                uri: 'https://live.bilibili.com/14047',
+                history: { oid: 14047, epid: 0, bvid: '', page: 0, cid: 0, part: '', business: 'live', dt: 2 },
+                videos: 0, author_name: 'Zelo-Balance', author_face: 'http://i1.hdslb.com/bfs/face/z.jpg', author_mid: 19193,
+                view_at: 1588800000, progress: 0, badge: '直播中', show_title: '', duration: 0, kid: 14047,
+            },
+            { // article: cover from covers[], no duration/progress
+                title: '韩国漫画如何出海掘金', long_title: '', cover: '', covers: ['http://i0.hdslb.com/bfs/article/a.jpg'], uri: '',
+                history: { oid: 6470274, epid: 0, bvid: '', page: 0, cid: 0, part: '', business: 'article', dt: 2 },
+                videos: 0, author_name: '三文娱', author_face: 'http://i1.hdslb.com/bfs/face/s.jpg', author_mid: 34772409,
+                view_at: 1588790000, progress: 0, badge: '专栏', show_title: '', duration: 0, kid: 6470274,
+            },
+            { // article-list: rl pseudo id, url points at the read article
+                title: 'Vtuber形象塑造文集', long_title: '', cover: '', covers: ['http://i0.hdslb.com/bfs/article/l.jpg'], uri: '',
+                history: { oid: 268656, epid: 0, bvid: '', page: 0, cid: 6233590, part: '', business: 'article-list', dt: 2 },
+                videos: 0, author_name: '普天一光', author_face: 'http://i2.hdslb.com/bfs/face/p.jpg', author_mid: 6614889,
+                view_at: 1588780000, progress: 0, badge: '专栏', show_title: '', duration: 0, kid: 268656,
+            },
+            { // unknown business -> skipped defensively
+                title: 'mystery', history: { oid: 1, business: 'cheese' }, view_at: 1588770000, kid: 1,
+            },
+            { // broken: no view_at -> skipped
+                title: 'broken', history: { oid: 2, bvid: 'BVx', business: 'archive' }, view_at: 0, kid: 2,
+            },
+        ],
+    },
+};
+const hp = Core.parseHistoryCursorPage(histJson, 0);
+assertEq(hp.videos.length, 5, 'known business types collected, unknown/broken skipped');
+const hv = hp.videos[0];
+assertEq(hv.bvid, 'BV1NK41157EF', 'archive id = bvid');
+assertEq(hv.url, 'https://www.bilibili.com/video/BV1NK41157EF', 'archive url');
+assertEq(hv.upMid, '3391089', 'archive upMid = author_mid');
+assertEq(hv.duration, '6:29', 'archive duration formatted from seconds');
+assertEq(hv.viewAt, 1588828357, 'viewAt recorded');
+assertEq(hv.progress, 277, 'progress recorded (seconds)');
+assertEq(hv.pubTs, 1588828357, 'history-only entry pubTs = view_at (import guard needs nonzero)');
+assertEq(hv.sources, ['history'], 'history source tag');
+assertEq(hv.hisKid, 'archive_497899395', 'archive hisKid = archive_{avid}');
+assertEq(hv.cover.startsWith('https://'), true, 'cover http->https');
+assertEq(hp.ups['3391089'], { name: '数字云糕', face: 'https://i2.hdslb.com/bfs/face/2.jpg' }, 'author into ups table');
+const hp2v = hp.videos[1];
+assertEq(hp2v.bvid, 'ep326789', 'pgc pseudo id ep{epid} (matches bangumi lane)');
+assertEq(hp2v.title, '百妖谱 第8话 庆忌（下）', 'pgc title = show + episode');
+assertEq(hp2v.url, 'https://www.bilibili.com/bangumi/play/ep326789', 'pgc url = ep page');
+assertEq(hp2v.upMid, '', 'pgc has no up');
+assertEq(hp2v.hisKid, 'pgc_26193', 'pgc hisKid = pgc_{ssid} (kid field, NOT oid)');
+assertEq(hp2v.badge, '国创', 'pgc badge kept');
+const hp3v = hp.videos[2];
+assertEq(hp3v.bvid, 'live14047', 'live pseudo id');
+assertEq(hp3v.url, 'https://live.bilibili.com/14047', 'live url = room');
+assertEq(hp3v.duration, '', 'live duration empty');
+assertEq(hp3v.hisKid, 'live_14047', 'live hisKid');
+const hp4v = hp.videos[3];
+assertEq(hp4v.bvid, 'cv6470274', 'article pseudo id');
+assertEq(hp4v.cover, 'https://i0.hdslb.com/bfs/article/a.jpg', 'article cover from covers[0]');
+assertEq(hp4v.url, 'https://www.bilibili.com/read/cv6470274', 'article url');
+const hp5v = hp.videos[4];
+assertEq(hp5v.bvid, 'rl268656', 'article-list pseudo id');
+assertEq(hp5v.url, 'https://www.bilibili.com/read/cv6233590', 'article-list url points at the read article (history.cid)');
+assertEq(hp.cursor.max, 497899395, 'cursor passthrough for next page');
+assertEq(hp.oldestViewAt, 1588770000, 'oldestViewAt = min view_at seen (any business type - paging signal, mirrors parseFeedPage)');
+assertEq(hp.newestViewAt, 1588828357, 'newestViewAt = max view_at');
+// sinceViewAt filter
+assertEq(Core.parseHistoryCursorPage(histJson, 1588800001).videos.length, 2, 'incremental bound keeps newer items only');
+assertEq(Core.parseHistoryCursorPage(histJson, 1588800001).videos[0].bvid, 'BV1NK41157EF', 'bound keeps newest archive first');
+// broken payloads
+assertEq(Core.parseHistoryCursorPage({}, 0).videos, [], 'empty json tolerated');
+assertEq(Core.parseHistoryCursorPage(null, 0).cursor, null, 'null json -> null cursor (paging stops)');
+
+// mergeVideos: history fields merged, viewAt keeps the LATEST view
+const hmap = {};
+Core.mergeVideos(hmap, [{ bvid: 'BVh', title: 't', pubTs: 5, upMid: '1', sources: ['follow'], cover: 'https://c/1.jpg' }]);
+let hm1 = Core.mergeVideos(hmap, [{ bvid: 'BVh', title: 't', pubTs: 5, upMid: '1', sources: ['history'], viewAt: 100, progress: 50, hisKid: 'archive_9' }]);
+assertEq(hm1.added, 0, 'history merge onto existing record is not a new entry');
+assertEq(hmap.BVh.sources.slice().sort(), ['follow', 'history'], 'history tag unioned');
+assertEq(hmap.BVh.pubTs, 5, 'publish timeline untouched by history merge');
+assertEq(hmap.BVh.viewAt, 100, 'viewAt backfilled');
+assertEq(hmap.BVh.hisKid, 'archive_9', 'hisKid backfilled');
+// newer view updates progress; older view does not regress
+Core.mergeVideos(hmap, [{ bvid: 'BVh', title: 't', pubTs: 5, upMid: '1', sources: ['history'], viewAt: 200, progress: 80, hisKid: 'archive_9' }]);
+assertEq(hmap.BVh.viewAt, 200, 'newer view wins');
+assertEq(hmap.BVh.progress, 80, 'progress follows the newer view');
+Core.mergeVideos(hmap, [{ bvid: 'BVh', title: 't', pubTs: 5, upMid: '1', sources: ['history'], viewAt: 150, progress: 10, hisKid: 'archive_9' }]);
+assertEq(hmap.BVh.viewAt, 200, 'older re-sighting never regresses viewAt');
+assertEq(hmap.BVh.progress, 80, 'older re-sighting never regresses progress');
+
+// filterByTab: 'all' excludes history-only entries
+const tabListH = [
+    { bvid: 'a', sources: ['follow'] },
+    { bvid: 'b', sources: ['follow', 'history'] },
+    { bvid: 'c', sources: ['history'] },
+    { bvid: 'd', sources: ['pgc'] },
+];
+assertEq(Core.filterByTab(tabListH, 'all').map((v) => v.bvid), ['a', 'b', 'd'], 'all tab excludes history-only entries');
+assertEq(Core.filterByTab(tabListH, 'history').map((v) => v.bvid), ['b', 'c'], 'history tab = entries with history tag');
+
+// sortForTab: history tab orders by viewAt (fallback pubTs), others untouched
+const hsort = [
+    { bvid: 'x', pubTs: 100, viewAt: 50 },
+    { bvid: 'y', pubTs: 10, viewAt: 900 },
+    { bvid: 'z', pubTs: 500 },
+];
+assertEq(Core.sortForTab(hsort.slice(), 'history').map((v) => v.bvid), ['y', 'z', 'x'], 'history tab: viewAt desc, missing viewAt falls back to pubTs');
+assertEq(Core.sortForTab(hsort.slice(), 'all').map((v) => v.bvid), ['x', 'y', 'z'], 'other tabs keep incoming order');
+
+// removeHistorySource: tag removed, metadata stripped, record dies only when sources empty
+const rstate = {
+    videos: {
+        hOnly: { bvid: 'hOnly', pubTs: 1, sources: ['history'], viewAt: 9, progress: 3, hisKid: 'archive_1' },
+        cross: { bvid: 'cross', pubTs: 2, sources: ['follow', 'history'], viewAt: 9, progress: 3, hisKid: 'archive_2' },
+        plain: { bvid: 'plain', pubTs: 3, sources: ['follow'] },
+    },
+    ups: {}, seasons: {},
+};
+assertEq(Core.removeHistorySource(rstate, 'hOnly'), true, 'remove history-only entry reports true');
+assertEq(rstate.videos.hOnly, undefined, 'history-only entry deleted (sources empty)');
+assertEq(Core.removeHistorySource(rstate, 'cross'), true, 'remove tag from cross entry');
+assertEq(rstate.videos.cross.sources, ['follow'], 'cross entry survives via follow tag');
+assertEq(rstate.videos.cross.viewAt, undefined, 'stale watch metadata stripped');
+assertEq(rstate.videos.cross.hisKid, undefined, 'stale hisKid stripped');
+assertEq(Core.removeHistorySource(rstate, 'plain'), false, 'entry without history tag -> false');
+assertEq(Core.removeHistorySource(rstate, 'nope'), false, 'missing entry -> false');
+
 // ---- summary ----
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

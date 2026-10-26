@@ -2,11 +2,12 @@
 // @name         B站关注动态聚合器 - 视频补课与增量归档
 // @name:en      Bilibili Follow Feed Aggregator - Video Backfill & Incremental Archive
 // @namespace    https://github.com/dnasdw
-// @version      2.7.0
-// @description  聚合全部关注UP主的视频动态（正式投稿+动态视频），按发布时间重建完整时间线。绕过B站关注动态页只能回看约75天历史的限制：支持从任意日期回溯补课（可扫到每个UP的第一条动态）、增量归档、断点续扫、新关注UP自动补全；追番追剧与订阅合集同步入库；联合投稿自动识别主UP主；多设备迁移
-// @description:en  Aggregate video dynamics (uploads + dynamic videos) from all followed creators into one timeline. Bypasses bilibili's ~75-day follow-feed history limit: backfill from any date (down to each creator's very first post), incremental updates, resumable scans, auto-backfill for newly followed creators; bangumi/drama and subscribed seasons synced in; joint uploads attributed to the primary uploader; JSON export/import for migration.
+// @version      2.8.0
+// @description  聚合全部关注UP主的视频动态（正式投稿+动态视频），按发布时间重建完整时间线。绕过B站关注动态页只能回看约75天历史的限制：支持从任意日期回溯补课（可扫到每个UP的第一条动态）、增量归档、断点续扫、新关注UP自动补全；追番追剧与订阅合集同步入库；联合投稿自动识别主UP主；观看历史本地存档（全类型收录，不受官方自动删除影响）；多设备迁移
+// @description:en  Aggregate video dynamics (uploads + dynamic videos) from all followed creators into one timeline. Bypasses bilibili's ~75-day follow-feed history limit: backfill from any date (down to each creator's very first post), incremental updates, resumable scans, auto-backfill for newly followed creators; bangumi/drama and subscribed seasons synced in; joint uploads attributed to the primary uploader; watch history archived locally (all item types, immune to server-side auto-deletion); JSON export/import for migration.
 // @author       dnasdw
 // @match        https://t.bilibili.com/*
+// @match        https://www.bilibili.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -37,6 +38,11 @@
  *                                                                     (only for videos seen in 2+ UPs'
  *                                                                     feeds; owner.mid = the true
  *                                                                     uploader, staff[] = roster)
+ *   GET /x/web-interface/history/cursor?max=&business=&view_at=     -> own watch history (all types,
+ *                                                                     cursor paging, local archive)
+ *   POST /x/v2/history/delete  (kid={business}_{id}&csrf=bili_jct)  -> cloud history delete
+ *                                                                     ("sync delete" buttons on the
+ *                                                                     official history page)
  */
 
 (function () {
@@ -66,6 +72,8 @@
         seasonArchives: (mid, seasonId, pn) => `https://api.bilibili.com/x/polymer/web-space/seasons_archives_list?mid=${mid}&season_id=${seasonId}&page_num=${pn}&page_size=30&sort_reverse=false`,
         bangumiFollow: (mid, type, pn) => `https://api.bilibili.com/x/space/bangumi/follow/list?vmid=${mid}&type=${type}&pn=${pn}&ps=30`,
         pgcSeason: (seasonId) => `https://api.bilibili.com/pgc/view/web/season?season_id=${seasonId}`,
+        historyCursor: (max, business, viewAt) => `https://api.bilibili.com/x/web-interface/history/cursor?max=${max}&business=${business}&view_at=${viewAt}&type=all&ps=30`,
+        historyDelete: 'https://api.bilibili.com/x/v2/history/delete',
     };
 
     // ============================ Pure core (testable, no DOM / no GM) ============================
@@ -185,6 +193,15 @@
                     for (const s of v.sources || []) {
                         if (ex.sources.indexOf(s) === -1) ex.sources.push(s);
                     }
+                    // history lane: refresh watch metadata, the latest view wins;
+                    // an older re-sighting (already superseded locally) changes nothing
+                    if ((v.sources || []).indexOf('history') !== -1) {
+                        if (v.viewAt && (!ex.viewAt || v.viewAt >= ex.viewAt)) {
+                            ex.viewAt = v.viewAt;
+                            if (typeof v.progress === 'number') ex.progress = v.progress;
+                        }
+                        if (!ex.hisKid && v.hisKid) ex.hisKid = v.hisKid;
+                    }
                 }
             }
             return { added, conflicts };
@@ -204,6 +221,7 @@
                 .filter((s) => s.mid);
             return {
                 bvid: String(d.bvid || ''),
+                aid: Number(d.aid) || 0, // cloud-history delete needs archive_{avid}
                 ownerMid: String(owner.mid || ''),
                 ownerName: owner.name || '',
                 ownerFace: String(owner.face || '').replace(/^http:\/\//, 'https://'),
@@ -384,6 +402,104 @@
             };
         },
 
+        /** Parse one history/cursor page (the user's own watch history).
+         *  Every business type is archived, each mapped onto the shared record
+         *  schema with a stable pseudo id:
+         *    archive -> bvid (cross-merges with the follow lane)
+         *    pgc     -> 'ep{epid}' (cross-merges with the bangumi lane)
+         *    live    -> 'live{room id}'
+         *    article -> 'cv{cvid}'
+         *    article-list -> 'rl{rlid}'
+         *  Fields the business type lacks (live/article duration, progress)
+         *  stay empty - the UI tolerates missing values. hisKid carries the
+         *  cloud-delete target ('{business}_{id}'; pgc uses the season id from
+         *  the kid field, NOT history.oid which is an avid there).
+         *  Returns { videos, ups, oldestViewAt, newestViewAt, cursor }. */
+        parseHistoryCursorPage(json, sinceViewAt) {
+            const data = (json && json.data) || {};
+            const list = data.list || [];
+            const videos = [];
+            const ups = {};
+            let oldestViewAt = Infinity;
+            let newestViewAt = 0;
+
+            for (const it of list) {
+                const h = it.history || {};
+                const viewAt = Number(it.view_at) || 0;
+                if (!viewAt) continue;
+                if (viewAt < oldestViewAt) oldestViewAt = viewAt;
+                if (viewAt > newestViewAt) newestViewAt = viewAt;
+                if (viewAt < sinceViewAt) continue;
+
+                const biz = String(h.business || '');
+                let id = '', url = '';
+                if (biz === 'archive' && h.bvid) {
+                    id = String(h.bvid);
+                    url = 'https://www.bilibili.com/video/' + h.bvid;
+                } else if (biz === 'pgc' && h.epid) {
+                    id = 'ep' + h.epid;
+                    url = 'https://www.bilibili.com/bangumi/play/ep' + h.epid;
+                } else if (biz === 'live' && h.oid) {
+                    id = 'live' + h.oid;
+                    url = 'https://live.bilibili.com/' + h.oid;
+                } else if (biz === 'article' && h.oid) {
+                    id = 'cv' + h.oid;
+                    url = 'https://www.bilibili.com/read/cv' + h.oid;
+                } else if (biz === 'article-list' && h.oid) {
+                    id = 'rl' + h.oid;
+                    url = h.cid ? 'https://www.bilibili.com/read/cv' + h.cid : '';
+                } else {
+                    continue; // unknown business type: skip defensively
+                }
+
+                const cover = String((Array.isArray(it.covers) && it.covers[0]) || it.cover || '')
+                    .replace(/^http:\/\//, 'https://');
+                const upMid = String(it.author_mid || '');
+                if (upMid && !ups[upMid]) {
+                    ups[upMid] = {
+                        name: it.author_name || '',
+                        face: String(it.author_face || '').replace(/^http:\/\//, 'https://'),
+                    };
+                }
+
+                let title = it.title || '';
+                if (biz === 'pgc') {
+                    const ep = it.show_title || it.long_title || '';
+                    if (ep && ep !== title) title = (title ? title + ' ' : '') + ep;
+                }
+                const durSec = Number(it.duration) || 0;
+                const kidId = (biz === 'pgc') ? (it.kid || '') : (h.oid || '');
+
+                videos.push({
+                    bvid: id,
+                    title: title || '(无标题)',
+                    pubTs: viewAt, // history-only entries live on the watch timeline
+                    upMid,
+                    duration: durSec ? Core.fmtDuration(durSec) : '',
+                    badge: it.badge || '',
+                    cover,
+                    url,
+                    sources: ['history'],
+                    viewAt,
+                    progress: Number(it.progress) || 0,
+                    hisKid: kidId ? (biz + '_' + kidId) : '',
+                });
+            }
+
+            const cur = data.cursor || {};
+            return {
+                videos,
+                ups,
+                oldestViewAt: oldestViewAt === Infinity ? 0 : oldestViewAt,
+                newestViewAt,
+                cursor: (Number(cur.max) || 0) ? {
+                    max: Number(cur.max) || 0,
+                    business: String(cur.business || ''),
+                    viewAt: Number(cur.view_at) || 0,
+                } : null,
+            };
+        },
+
         /** Parse one page of the bangumi follow list (type=1 anime / type=2 drama). */
         parseBangumiFollowList(json) {
             const data = (json && json.data) || {};
@@ -405,10 +521,51 @@
             return h > 0 ? `${h}:${p(m % 60)}:${p(s % 60)}` : `${m}:${p(s % 60)}`;
         },
 
-        /** Tab filter: tabs are driven by the sources array of each entry. */
+        /** Tab filter: tabs are driven by the sources array of each entry.
+         *  'all' excludes history-only entries (watch history is an archive
+         *  lane, not part of the aggregated timeline). */
         filterByTab(list, tab) {
-            if (tab === 'all') return list;
+            if (tab === 'all') {
+                return list.filter((v) => (v.sources || []).some((s) => s !== 'history'));
+            }
             return list.filter((v) => (v.sources || []).indexOf(tab) !== -1);
+        },
+
+        /** The history tab orders by watch time (viewAt, pubTs fallback);
+         *  every other tab keeps the publish-time ordering. */
+        sortForTab(list, tab) {
+            if (tab !== 'history') return list;
+            return list.slice().sort((a, b) => ((b.viewAt || b.pubTs) || 0) - ((a.viewAt || a.pubTs) || 0));
+        },
+
+        /** Human text for the watch progress of a history entry.
+         *  progress < 0 -> finished; > 0 -> "看到 m:ss"; 0/missing -> ''. */
+        fmtWatchProgress(v) {
+            const prog = Number(v.progress) || 0;
+            if (prog < 0) return '已看完';
+            if (prog > 0) return '看到 ' + Core.fmtDuration(prog);
+            return '';
+        },
+
+        /** Sorted + filtered list for one tab (single entry point for the UI). */
+        tabList(map, tab) {
+            return Core.sortForTab(Core.filterByTab(Core.sortedList(map), tab), tab);
+        },
+
+        /** Drop the 'history' tag from an entry (user-triggered local delete).
+         *  Watch metadata is stripped; the record itself is deleted only when
+         *  no source tag remains - same contract as every other cleanup. */
+        removeHistorySource(state, bvid) {
+            const v = state.videos[bvid];
+            if (!v) return false;
+            const i = (v.sources || []).indexOf('history');
+            if (i === -1) return false;
+            v.sources.splice(i, 1);
+            delete v.viewAt;
+            delete v.progress;
+            delete v.hisKid;
+            if (!v.sources.length) delete state.videos[bvid];
+            return true;
         },
 
         /**
@@ -712,7 +869,7 @@
         },
 
         freshData() {
-            return { version: 3, videos: {}, ups: {}, seasons: {}, lastScanTs: 0, globalFloorTs: 0, scan: null };
+            return { version: 3, videos: {}, ups: {}, seasons: {}, lastScanTs: 0, globalFloorTs: 0, historyLastViewAt: 0, scan: null };
         },
 
         loadData() {
@@ -745,6 +902,7 @@
             if (!state.seasons || typeof state.seasons !== 'object') state.seasons = {};
             if (typeof state.globalFloorTs !== 'number' || !state.globalFloorTs) state.globalFloorTs = 0;
             if (typeof state.lastScanTs !== 'number') state.lastScanTs = 0;
+            if (typeof state.historyLastViewAt !== 'number') state.historyLastViewAt = 0;
             if (!state.scan || !Array.isArray(state.scan.queue)) state.scan = null;
             return state;
         },
@@ -973,6 +1131,45 @@
         throw lastErr || new ApiError(-4, '请求失败');
     }
 
+    /** bili_jct cookie = the csrf token bilibili's own frontend posts along. */
+    function getCsrf() {
+        const m = document.cookie.match(/(?:^|;\s*)bili_jct=([^;]+)/);
+        return m ? decodeURIComponent(m[1]) : '';
+    }
+
+    /**
+     * Fire-and-report form POST (history deletion etc). Throttled like apiGet
+     * but NOT auto-retried: user-triggered mutations should surface failures
+     * immediately instead of silently repeating.
+     * Returns the parsed json body (code may be non-zero).
+     */
+    async function apiPostForm(url, params, referer) {
+        await throttle();
+        const body = Object.keys(params)
+            .map((k) => encodeURIComponent(k) + '=' + encodeURIComponent(params[k]))
+            .join('&');
+        try {
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), CONFIG.requestTimeoutMs);
+            try {
+                const res = await fetch(url, {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body,
+                    signal: ctrl.signal,
+                });
+                if (res.status !== 200) throw new ApiError(res.status, `HTTP ${res.status}`);
+                return JSON.parse(await res.text());
+            } finally {
+                clearTimeout(timer);
+            }
+        } catch (e) {
+            if (e instanceof ApiError) throw e;
+            throw new RetryableError(-3, 'POST 请求失败');
+        }
+    }
+
     // ============================ Scan engine ============================
 
     const ScanEngine = {
@@ -1135,6 +1332,32 @@
             return merged.added;
         },
 
+        /** Archive the user's own watch history (all business types), paging
+         *  the cursor API until the cloud runs out or the page content goes
+         *  older than sinceViewAt. The newest view_at seen becomes the
+         *  incremental bound for the next scan; cloud-side auto-deletion can
+         *  never touch what is already stored locally. */
+        async scanHistory(state, sinceViewAt) {
+            let max = 0, business = '', viewAt = 0;
+            let found = 0;
+            let newest = sinceViewAt;
+            for (let i = 0; i < 2000; i++) { // safety cap: 2000 pages x 30 items
+                const json = await apiGet(API.historyCursor(max, business, viewAt), 'https://www.bilibili.com/history');
+                const page = Core.parseHistoryCursorPage(json, sinceViewAt);
+                const merged = Core.mergeVideos(state.videos, page.videos);
+                found += merged.added;
+                Core.mergeUps(state.ups, page.ups);
+                for (const c of merged.conflicts) await this.resolveCoopOwner(state, c.bvid);
+                if (page.newestViewAt > newest) newest = page.newestViewAt;
+                UI.progressSub(`历史记录 · 第${i + 1}页 · +${found}`);
+                // stop at the cloud's end, or when the page went older than the bound
+                if (!page.cursor || !page.videos.length || page.oldestViewAt < sinceViewAt) break;
+                max = page.cursor.max; business = page.cursor.business; viewAt = page.cursor.viewAt;
+            }
+            state.historyLastViewAt = Math.max(state.historyLastViewAt || 0, newest);
+            return found;
+        },
+
         /**
          * mode: 'full' (fresh sinceTs from UI date) | 'increment' (since lastScanTs)
          *       | 'resume' (continue stored scan)
@@ -1189,12 +1412,14 @@
                         }
                     }
 
-                    // interleave the three kinds round-robin (up / season / bangumi)
-                    // so parallel workers pick up all three source types from the start
+                    // interleave the four kinds round-robin (up / season /
+                    // bangumi / history) so parallel workers pick up every
+                    // source type from the start
                     const lanes = [
                         followings.map((u) => ({ kind: 'up', mid: u.mid, name: u.uname })),
                         collectedSeasons.map((s) => ({ kind: 'season', seasonId: s.seasonId, mid: s.mid, name: s.title })),
                         bangumiFollows.map((b) => ({ kind: 'bangumi', seasonId: b.seasonId, name: b.title || `追番 ${b.seasonId}` })),
+                        [{ kind: 'history', name: '历史记录' }],
                     ];
                     const queue = [];
                     let remaining = lanes.reduce((n, l) => n + l.length, 0);
@@ -1237,6 +1462,12 @@
                             found = await this.scanSeason(entry, 0, state);
                         } else if (entry.kind === 'bangumi') {
                                 found = await this.scanBangumi(entry, state);
+                            } else if (entry.kind === 'history') {
+                                // full mode: sinceViewAt 0 -> archive everything the
+                                // cloud still has; increment: continue from the last
+                                // newest view_at seen
+                                const sinceViewAt = (scan.mode === 'increment') ? (state.historyLastViewAt || 0) : 0;
+                                found = await this.scanHistory(state, sinceViewAt);
                             } else {
                                 const upSince = (scan.mode === 'increment')
                                     ? Core.incSinceTs(state.ups[entry.mid], state.globalFloorTs, state.lastScanTs)
@@ -1291,6 +1522,112 @@
         },
     };
 
+    // ============================ Official history page injector ============================
+
+    const HistoryPage = {
+        observer: null,
+
+        /** Runs only on www.bilibili.com/history: injects a "sync delete"
+         *  button (cloud + local) into every watch-history card. The official
+         *  page's own delete button only touches the cloud - local archives
+         *  survive it, same as bilibili's server-side auto-deletion. */
+        init() {
+            if (location.host !== 'www.bilibili.com' || location.pathname !== '/history') return;
+            try {
+                this.observer = new MutationObserver(() => this.inject());
+                this.observer.observe(document.body, { childList: true, subtree: true });
+                this.inject();
+            } catch (e) { /* never break the host page */ }
+        },
+
+        /** Map a card link to { biz, id, oid } in local-record terms.
+         *  id: local record key (bvid / ep{n} / live{n} / cv{n}); oid: the raw
+         *  cloud id when derivable from the url alone. */
+        parseTarget(href) {
+            let m;
+            if ((m = href.match(/\/video\/(BV[a-zA-Z0-9]+)/))) return { biz: 'archive', id: m[1], oid: '' };
+            if ((m = href.match(/live\.bilibili\.com\/(\d+)/))) return { biz: 'live', id: 'live' + m[1], oid: m[1] };
+            if ((m = href.match(/\/read\/cv(\d+)/))) return { biz: 'article', id: 'cv' + m[1], oid: m[1] };
+            if ((m = href.match(/\/bangumi\/play\/ep(\d+)/))) return { biz: 'pgc', id: 'ep' + m[1], oid: '' };
+            return null;
+        },
+
+        inject() {
+            const links = document.querySelectorAll(
+                'a[href*="/video/BV"], a[href*="live.bilibili.com/"], a[href*="/read/cv"], a[href*="/bangumi/play/ep"]'
+            );
+            for (const a of links) {
+                if (a.dataset.bfuaDone) continue;
+                a.dataset.bfuaDone = '1';
+                const t = this.parseTarget(a.getAttribute('href') || '');
+                if (!t) continue;
+                const card = this.findCard(a);
+                const host = card || a.parentElement || a;
+                if (!host || host.querySelector('.bfua-sync-del')) continue;
+                if (getComputedStyle(host).position === 'static') host.style.position = 'relative';
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'bfua-sync-del';
+                btn.textContent = '同步删除';
+                btn.title = '同时删除B站云端与本插件本地的这条历史记录';
+                btn.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    this.deleteBoth(t, btn);
+                });
+                host.appendChild(btn);
+            }
+        },
+
+        /** Heuristic card container: nearest ancestor that has an image and
+         *  spans like a card. Falls back to the link's parent so the button
+         *  keeps working (possibly less pretty) through bilibili redesigns. */
+        findCard(a) {
+            let el = a;
+            for (let i = 0; i < 6 && el.parentElement; i++) {
+                el = el.parentElement;
+                try {
+                    if (el.querySelector('img') && el.children.length >= 2 && el.getBoundingClientRect().height > 40) return el;
+                } catch (e) { /* detached node */ }
+            }
+            return null;
+        },
+
+        /** Delete one history entry both cloud-side and locally. */
+        async deleteBoth(t, btn) {
+            if (!confirm('同时删除B站云端与本插件本地的这条历史记录？')) return;
+            btn.disabled = true;
+            try {
+                const state = Store.load();
+                const rec = state.videos[t.id];
+                let kid = (rec && rec.hisKid) || '';
+                if (!kid && t.biz === 'archive') {
+                    // not archived locally yet: resolve the avid via the detail api
+                    const json = await apiGet(API.videoView(t.id), 'https://www.bilibili.com/video/' + t.id);
+                    const info = Core.parseVideoView(json);
+                    if (info.aid) kid = 'archive_' + info.aid;
+                }
+                if (!kid && t.oid) kid = t.biz + '_' + t.oid; // live/article: url carries the id
+                if (!kid) {
+                    UI.log('无法确定该条目的云端标识（本地尚未入库，且类型无法从链接推断），请先执行一次增量更新', 'warn');
+                    btn.disabled = false;
+                    return;
+                }
+                const csrf = getCsrf();
+                if (!csrf) { UI.log('未读取到 bili_jct（登录态失效？），无法删除云端记录', 'warn'); btn.disabled = false; return; }
+                const res = await apiPostForm(API.historyDelete, { kid, csrf }, 'https://www.bilibili.com/history');
+                if (res.code !== 0) { UI.log(`云端历史删除失败：${res.message || res.code}`, 'error'); btn.disabled = false; return; }
+                Core.removeHistorySource(state, t.id);
+                Store.save(state);
+                UI.log(`已同时删除云端与本地历史（${kid}）`);
+                btn.textContent = '已删除';
+            } catch (e) {
+                UI.log(`同步删除失败：${e.message}`, 'error');
+                btn.disabled = false;
+            }
+        },
+    };
+
     // ============================ UI ============================
 
     const UI = {
@@ -1336,6 +1673,11 @@
 .bfua-coop{color:#9499a0;font-size:11px;cursor:help;flex:0 0 auto}
 .bfua-badge-dyn{color:#ff7f24;border:1px solid #ffb27a;border-radius:4px;padding:0 4px;font-size:11px}
 .bfua-dur{color:#9499a0;font-size:12px;margin-left:auto;flex:0 0 auto}
+ .bfua-del{color:#9499a0;font-size:13px;cursor:pointer;flex:0 0 auto;padding:0 2px;user-select:none}
+.bfua-del:hover{color:#e0533d}
+.bfua-sync-del{position:absolute;right:8px;top:8px;z-index:99;border:1px solid #e3e5e7;background:rgba(255,255,255,.92);color:#61666d;border-radius:6px;padding:2px 8px;font-size:12px;cursor:pointer}
+.bfua-sync-del:hover{color:#e0533d;border-color:#ffb4a8}
+.bfua-sync-del:disabled{opacity:.5;cursor:default}
 .bfua-title{font-size:13.5px;margin:3px 0;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
 .bfua-time{color:#9499a0;font-size:12px;font-family:Consolas,monospace}
 #bfua-pager{display:flex;gap:5px;align-items:center;justify-content:center;padding:8px 0;flex-wrap:nowrap;overflow-x:auto}
@@ -1412,6 +1754,7 @@
       <option value="follow">视频投稿</option>
       <option value="pgc">追番追剧</option>
       <option value="season">订阅合集</option>
+      <option value="history">历史记录</option>
     </select>
   </label>
   <label><input type="checkbox" id="bfua-set-del-unsub"> 取消订阅合集时移除对应记录</label>
@@ -1601,6 +1944,7 @@
             { id: 'follow', label: '视频投稿' },
             { id: 'pgc', label: '追番追剧' },
             { id: 'season', label: '订阅合集' },
+            { id: 'history', label: '历史记录' },
         ],
 
         currentTab: null,
@@ -1638,7 +1982,7 @@
         captureAnchor() {
             this.anchorBvid = null;
             const state = Store.load();
-            const list = Core.filterByTab(Core.sortedList(state.videos), this.currentTab || this.loadTab());
+            const list = Core.tabList(state.videos, this.currentTab || this.loadTab());
             if (!list.length) return;
             const pages = Math.ceil(list.length / CONFIG.listPageSize);
             const page = Math.min(this.loadPage() || 1, pages);
@@ -1649,7 +1993,7 @@
         /** Re-render the list positioned so the anchor video is still visible. */
         renderListAnchored() {
             const state = Store.load();
-            const list = Core.filterByTab(Core.sortedList(state.videos), this.currentTab || this.loadTab());
+            const list = Core.tabList(state.videos, this.currentTab || this.loadTab());
             this.renderList(Core.pageForAnchor(list, this.anchorBvid, CONFIG.listPageSize));
         },
 
@@ -1667,7 +2011,8 @@
 
         renderList(page) {
             const state = Store.load();
-            const list = Core.filterByTab(Core.sortedList(state.videos), this.currentTab || this.loadTab());
+            const tab = this.currentTab || this.loadTab();
+            const list = Core.tabList(state.videos, tab);
             const pages = Math.max(1, Math.ceil(list.length / CONFIG.listPageSize));
             page = Math.min(Math.max(1, page), pages);
             this.currentPage = page;
@@ -1740,8 +2085,23 @@
                         badge.textContent = v.badge;
                         line1.appendChild(badge);
                     }
-                    const dur = document.createElement('span'); dur.className = 'bfua-dur'; dur.textContent = v.duration;
+                    const dur = document.createElement('span'); dur.className = 'bfua-dur';
+                    // history tab: watch progress replaces the plain duration
+                    dur.textContent = (tab === 'history' && Core.fmtWatchProgress(v)) || v.duration;
                     line1.appendChild(dur);
+                    // local-only delete for history entries (cloud stays untouched)
+                    if (tab === 'history' && (v.sources || []).indexOf('history') !== -1) {
+                        const del = document.createElement('span');
+                        del.className = 'bfua-del';
+                        del.textContent = '✕';
+                        del.title = '删除本地历史记录（B站云端记录不受影响）';
+                        del.addEventListener('click', (e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            this.deleteLocalHistory(v.bvid);
+                        });
+                        line1.appendChild(del);
+                    }
                     meta.appendChild(line1);
 
                     const title = document.createElement('div');
@@ -1751,7 +2111,8 @@
 
                     const time = document.createElement('div');
                     time.className = 'bfua-time';
-                    time.textContent = Core.fmtDateTime(v.pubTs);
+                    // history tab lives on the watch timeline
+                    time.textContent = Core.fmtDateTime((tab === 'history' && v.viewAt) ? v.viewAt : v.pubTs);
                     meta.appendChild(time);
 
                     a.appendChild(meta);
@@ -1799,6 +2160,20 @@
                 jumpInput,
                 jumpBtn,
             );
+        },
+
+        /** Drop the local history tag of one entry (user clicked ✕ on a card).
+         *  Cross-source entries survive via their remaining tags. */
+        deleteLocalHistory(bvid) {
+            const state = Store.load();
+            if (!Core.removeHistorySource(state, bvid)) {
+                this.log('该条目没有本地历史记录', 'warn');
+                return;
+            }
+            Store.save(state);
+            this.log(`已删除本地历史记录 ${bvid}（B站云端记录不受影响）`);
+            this.renderStats();
+            this.renderList(this.currentPage);
         },
 
         async importJson(file) {
@@ -1889,6 +2264,7 @@
         }
         UI.build();
         Sleeper.init(); // worker-based timer keeps scans running in background tabs
+        HistoryPage.init(); // official history page: sync-delete buttons
         console.log('[bfua] 关注UP视频聚合器已加载');
     }
 
