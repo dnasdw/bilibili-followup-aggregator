@@ -675,6 +675,14 @@ assertEq(rstate.videos.cross.hisKid, undefined, 'stale hisKid stripped');
 assertEq(Core.removeHistorySource(rstate, 'plain'), false, 'entry without history tag -> false');
 assertEq(Core.removeHistorySource(rstate, 'nope'), false, 'missing entry -> false');
 
+// fmtWatchProgress: "cur / total" format (mirrors the official history page)
+assertEq(Core.fmtWatchProgress({ progress: 332, duration: '10:21' }), '5:32 / 10:21', 'progress shown as cur / total');
+assertEq(Core.fmtWatchProgress({ progress: -1, duration: '10:21' }), '已看完', 'negative progress = finished');
+assertEq(Core.fmtWatchProgress({ progress: 621, duration: '10:21' }), '10:21 / 10:21', 'watched to the end still shows cur / total');
+assertEq(Core.fmtWatchProgress({ progress: 0, duration: '10:21' }), '', 'no progress -> empty (UI falls back to duration text)');
+assertEq(Core.fmtWatchProgress({ progress: 100 }), '1:40', 'no duration text -> current position only');
+assertEq(Core.fmtWatchProgress({}), '', 'nothing -> empty');
+
 // ---- summary ----
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);
