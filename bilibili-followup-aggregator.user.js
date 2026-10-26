@@ -2,7 +2,7 @@
 // @name         B站关注动态聚合器 - 视频补课与增量归档
 // @name:en      Bilibili Follow Feed Aggregator - Video Backfill & Incremental Archive
 // @namespace    https://github.com/dnasdw
-// @version      2.8.0
+// @version      2.8.1
 // @description  聚合全部关注UP主的视频动态（正式投稿+动态视频），按发布时间重建完整时间线。绕过B站关注动态页只能回看约75天历史的限制：支持从任意日期回溯补课（可扫到每个UP的第一条动态）、增量归档、断点续扫、新关注UP自动补全；追番追剧与订阅合集同步入库；联合投稿自动识别主UP主；观看历史本地存档（全类型收录，不受官方自动删除影响）；多设备迁移
 // @description:en  Aggregate video dynamics (uploads + dynamic videos) from all followed creators into one timeline. Bypasses bilibili's ~75-day follow-feed history limit: backfill from any date (down to each creator's very first post), incremental updates, resumable scans, auto-backfill for newly followed creators; bangumi/drama and subscribed seasons synced in; joint uploads attributed to the primary uploader; watch history archived locally (all item types, immune to server-side auto-deletion); JSON export/import for migration.
 // @author       dnasdw
@@ -869,7 +869,7 @@
         },
 
         freshData() {
-            return { version: 3, videos: {}, ups: {}, seasons: {}, lastScanTs: 0, globalFloorTs: 0, historyLastViewAt: 0, scan: null };
+            return { version: 3, videos: {}, ups: {}, seasons: {}, lastScanTs: 0, globalFloorTs: 0, scan: null };
         },
 
         loadData() {
@@ -902,7 +902,6 @@
             if (!state.seasons || typeof state.seasons !== 'object') state.seasons = {};
             if (typeof state.globalFloorTs !== 'number' || !state.globalFloorTs) state.globalFloorTs = 0;
             if (typeof state.lastScanTs !== 'number') state.lastScanTs = 0;
-            if (typeof state.historyLastViewAt !== 'number') state.historyLastViewAt = 0;
             if (!state.scan || !Array.isArray(state.scan.queue)) state.scan = null;
             return state;
         },
@@ -1333,28 +1332,25 @@
         },
 
         /** Archive the user's own watch history (all business types), paging
-         *  the cursor API until the cloud runs out or the page content goes
-         *  older than sinceViewAt. The newest view_at seen becomes the
-         *  incremental bound for the next scan; cloud-side auto-deletion can
-         *  never touch what is already stored locally. */
-        async scanHistory(state, sinceViewAt) {
+         *  the cursor API to the very end of the cloud list on EVERY run
+         *  (same self-healing philosophy as the season lane): an entry
+         *  deleted locally but still alive in the cloud simply comes back on
+         *  the next scan, while a cloud-side deletion never resurfaces. */
+        async scanHistory(state) {
             let max = 0, business = '', viewAt = 0;
             let found = 0;
-            let newest = sinceViewAt;
             for (let i = 0; i < 2000; i++) { // safety cap: 2000 pages x 30 items
                 const json = await apiGet(API.historyCursor(max, business, viewAt), 'https://www.bilibili.com/history');
-                const page = Core.parseHistoryCursorPage(json, sinceViewAt);
+                const page = Core.parseHistoryCursorPage(json, 0);
                 const merged = Core.mergeVideos(state.videos, page.videos);
                 found += merged.added;
                 Core.mergeUps(state.ups, page.ups);
                 for (const c of merged.conflicts) await this.resolveCoopOwner(state, c.bvid);
-                if (page.newestViewAt > newest) newest = page.newestViewAt;
                 UI.progressSub(`历史记录 · 第${i + 1}页 · +${found}`);
-                // stop at the cloud's end, or when the page went older than the bound
-                if (!page.cursor || !page.videos.length || page.oldestViewAt < sinceViewAt) break;
+                // stop only at the cloud's end
+                if (!page.cursor || !page.videos.length) break;
                 max = page.cursor.max; business = page.cursor.business; viewAt = page.cursor.viewAt;
             }
-            state.historyLastViewAt = Math.max(state.historyLastViewAt || 0, newest);
             return found;
         },
 
@@ -1463,11 +1459,10 @@
                         } else if (entry.kind === 'bangumi') {
                                 found = await this.scanBangumi(entry, state);
                             } else if (entry.kind === 'history') {
-                                // full mode: sinceViewAt 0 -> archive everything the
-                                // cloud still has; increment: continue from the last
-                                // newest view_at seen
-                                const sinceViewAt = (scan.mode === 'increment') ? (state.historyLastViewAt || 0) : 0;
-                                found = await this.scanHistory(state, sinceViewAt);
+                                // always pull the WHOLE cloud history: local-only
+                                // deletions self-heal on the next scan (season-lane
+                                // philosophy); cloud deletions never come back
+                                found = await this.scanHistory(state);
                             } else {
                                 const upSince = (scan.mode === 'increment')
                                     ? Core.incSinceTs(state.ups[entry.mid], state.globalFloorTs, state.lastScanTs)
@@ -1562,9 +1557,8 @@
                 const t = this.parseTarget(a.getAttribute('href') || '');
                 if (!t) continue;
                 const card = this.findCard(a);
-                const host = card || a.parentElement || a;
-                if (!host || host.querySelector('.bfua-sync-del')) continue;
-                if (getComputedStyle(host).position === 'static') host.style.position = 'relative';
+                if (!card) continue;
+                if (card.querySelector('.bfua-sync-del')) continue;
                 const btn = document.createElement('button');
                 btn.type = 'button';
                 btn.className = 'bfua-sync-del';
@@ -1575,8 +1569,36 @@
                     e.stopPropagation();
                     this.deleteBoth(t, btn);
                 });
-                host.appendChild(btn);
+                // preferred: right next to bilibili's own delete control so the
+                // two actions sit together and nothing is covered up
+                const official = this.findOfficialDelete(card);
+                if (official && official.parentElement) {
+                    official.parentElement.insertBefore(btn, official.nextSibling);
+                } else {
+                    // fallback: flow into the card's meta area end (no overlay)
+                    card.appendChild(btn);
+                }
             }
+        },
+
+        /** Locate bilibili's own per-card delete control (trash icon). Matched
+         *  defensively by class/title/aria hints and 删除 text - the selector
+         *  set may need touching up when bilibili redesigns the page. */
+        findOfficialDelete(card) {
+            let nodes = card.querySelectorAll('[class*="delete" i], [title*="删除"], [aria-label*="删除"]');
+            if (!nodes.length) {
+                nodes = card.querySelectorAll('button, [role="button"]');
+                nodes = Array.prototype.filter.call(nodes, (n) => (n.textContent || '').trim() === '删除');
+            }
+            for (const n of nodes) {
+                // skip wrappers: prefer the smallest actionable element
+                if (n.querySelector('button, [role="button"]') && !n.isSameNode(card)) continue;
+                try {
+                    const r = n.getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0 && r.height < 80) return n;
+                } catch (e) { /* detached */ }
+            }
+            return null;
         },
 
         /** Heuristic card container: nearest ancestor that has an image and
@@ -1673,9 +1695,9 @@
 .bfua-coop{color:#9499a0;font-size:11px;cursor:help;flex:0 0 auto}
 .bfua-badge-dyn{color:#ff7f24;border:1px solid #ffb27a;border-radius:4px;padding:0 4px;font-size:11px}
 .bfua-dur{color:#9499a0;font-size:12px;margin-left:auto;flex:0 0 auto}
- .bfua-del{color:#9499a0;font-size:13px;cursor:pointer;flex:0 0 auto;padding:0 2px;user-select:none}
-.bfua-del:hover{color:#e0533d}
-.bfua-sync-del{position:absolute;right:8px;top:8px;z-index:99;border:1px solid #e3e5e7;background:rgba(255,255,255,.92);color:#61666d;border-radius:6px;padding:2px 8px;font-size:12px;cursor:pointer}
+.bfua-del{border:1px solid #e3e5e7;background:#fff;color:#61666d;border-radius:6px;padding:3px 10px;font-size:12px;cursor:pointer;flex:0 0 auto;margin-left:6px}
+.bfua-del:hover{color:#e0533d;border-color:#ffb4a8}
+.bfua-sync-del{border:1px solid #e3e5e7;background:rgba(255,255,255,.92);color:#61666d;border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer;margin:0 4px}
 .bfua-sync-del:hover{color:#e0533d;border-color:#ffb4a8}
 .bfua-sync-del:disabled{opacity:.5;cursor:default}
 .bfua-title{font-size:13.5px;margin:3px 0;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
@@ -1694,7 +1716,11 @@
 .bfua-item:hover{background:#26272a}
 .bfua-item{border-bottom-color:#2f3134}
 .bfua-item .up{color:#00aeec}
-#bfua-pager input{background:#2f3134;border-color:#3f4145;color:#e3e5e7}
+ #bfua-pager input{background:#2f3134;border-color:#3f4145;color:#e3e5e7}
+ .bfua-del{background:#2f3134;border-color:#3f4145;color:#e3e5e7}
+ .bfua-del:hover{color:#ff8071;border-color:#ffb4a8}
+ .bfua-sync-del{background:rgba(30,32,34,.92);border-color:#3f4145;color:#e3e5e7}
+ .bfua-sync-del:hover{color:#ff8071;border-color:#ffb4a8}
 .bfua-cover,.bfua-cover-empty,.bfua-face,.bfua-face-empty{background:#3a3c40}
 }
 `;
@@ -2091,9 +2117,10 @@
                     line1.appendChild(dur);
                     // local-only delete for history entries (cloud stays untouched)
                     if (tab === 'history' && (v.sources || []).indexOf('history') !== -1) {
-                        const del = document.createElement('span');
+                        const del = document.createElement('button');
+                        del.type = 'button';
                         del.className = 'bfua-del';
-                        del.textContent = '✕';
+                        del.textContent = '删除';
                         del.title = '删除本地历史记录（B站云端记录不受影响）';
                         del.addEventListener('click', (e) => {
                             e.preventDefault();
