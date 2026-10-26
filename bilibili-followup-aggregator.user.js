@@ -2,7 +2,7 @@
 // @name         B站关注动态聚合器 - 视频补课与增量归档
 // @name:en      Bilibili Follow Feed Aggregator - Video Backfill & Incremental Archive
 // @namespace    https://github.com/dnasdw
-// @version      2.8.1
+// @version      2.8.2
 // @description  聚合全部关注UP主的视频动态（正式投稿+动态视频），按发布时间重建完整时间线。绕过B站关注动态页只能回看约75天历史的限制：支持从任意日期回溯补课（可扫到每个UP的第一条动态）、增量归档、断点续扫、新关注UP自动补全；追番追剧与订阅合集同步入库；联合投稿自动识别主UP主；观看历史本地存档（全类型收录，不受官方自动删除影响）；多设备迁移
 // @description:en  Aggregate video dynamics (uploads + dynamic videos) from all followed creators into one timeline. Bypasses bilibili's ~75-day follow-feed history limit: backfill from any date (down to each creator's very first post), incremental updates, resumable scans, auto-backfill for newly followed creators; bangumi/drama and subscribed seasons synced in; joint uploads attributed to the primary uploader; watch history archived locally (all item types, immune to server-side auto-deletion); JSON export/import for migration.
 // @author       dnasdw
@@ -1556,9 +1556,6 @@
                 a.dataset.bfuaDone = '1';
                 const t = this.parseTarget(a.getAttribute('href') || '');
                 if (!t) continue;
-                const card = this.findCard(a);
-                if (!card) continue;
-                if (card.querySelector('.bfua-sync-del')) continue;
                 const btn = document.createElement('button');
                 btn.type = 'button';
                 btn.className = 'bfua-sync-del';
@@ -1569,36 +1566,27 @@
                     e.stopPropagation();
                     this.deleteBoth(t, btn);
                 });
-                // preferred: right next to bilibili's own delete control so the
-                // two actions sit together and nothing is covered up
-                const official = this.findOfficialDelete(card);
-                if (official && official.parentElement) {
-                    official.parentElement.insertBefore(btn, official.nextSibling);
-                } else {
-                    // fallback: flow into the card's meta area end (no overlay)
-                    card.appendChild(btn);
-                }
+                this.placeButton(a, btn);
             }
         },
 
-        /** Locate bilibili's own per-card delete control (trash icon). Matched
-         *  defensively by class/title/aria hints and 删除 text - the selector
-         *  set may need touching up when bilibili redesigns the page. */
-        findOfficialDelete(card) {
-            let nodes = card.querySelectorAll('[class*="delete" i], [title*="删除"], [aria-label*="删除"]');
-            if (!nodes.length) {
-                nodes = card.querySelectorAll('button, [role="button"]');
-                nodes = Array.prototype.filter.call(nodes, (n) => (n.textContent || '').trim() === '删除');
+        /** Insert the button into the card's info column: on the line right
+         *  below the official right-actions row (fav-status + delete-btn),
+         *  right-aligned. Card layout on www.bilibili.com/history:
+         *    .history-card > .history-card__right > .info__top (title +
+         *    .right-actions [fav-status?, delete-btn]) + .info__bottom. */
+        placeButton(a, btn) {
+            const card = (typeof a.closest === 'function' && a.closest('.history-card')) || this.findCard(a);
+            if (!card) return;
+            if (card.querySelector('.bfua-sync-del')) return; // already injected
+            const infoTop = card.querySelector('.info__top');
+            if (infoTop && infoTop.parentElement) {
+                infoTop.insertAdjacentElement('afterend', btn); // line below right-actions
+            } else if (card.querySelector('.right-actions')) {
+                card.querySelector('.right-actions').insertAdjacentElement('afterend', btn);
+            } else {
+                card.appendChild(btn); // in-flow fallback: never overlays content
             }
-            for (const n of nodes) {
-                // skip wrappers: prefer the smallest actionable element
-                if (n.querySelector('button, [role="button"]') && !n.isSameNode(card)) continue;
-                try {
-                    const r = n.getBoundingClientRect();
-                    if (r.width > 0 && r.height > 0 && r.height < 80) return n;
-                } catch (e) { /* detached */ }
-            }
-            return null;
         },
 
         /** Heuristic card container: nearest ancestor that has an image and
@@ -1697,7 +1685,7 @@
 .bfua-dur{color:#9499a0;font-size:12px;margin-left:auto;flex:0 0 auto}
 .bfua-del{border:1px solid #e3e5e7;background:#fff;color:#61666d;border-radius:6px;padding:3px 10px;font-size:12px;cursor:pointer;flex:0 0 auto;margin-left:6px}
 .bfua-del:hover{color:#e0533d;border-color:#ffb4a8}
-.bfua-sync-del{border:1px solid #e3e5e7;background:rgba(255,255,255,.92);color:#61666d;border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer;margin:0 4px}
+.bfua-sync-del{display:block;width:fit-content;margin:4px 0 0 auto;border:1px solid #e3e5e7;background:rgba(255,255,255,.92);color:#61666d;border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer}
 .bfua-sync-del:hover{color:#e0533d;border-color:#ffb4a8}
 .bfua-sync-del:disabled{opacity:.5;cursor:default}
 .bfua-title{font-size:13.5px;margin:3px 0;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
