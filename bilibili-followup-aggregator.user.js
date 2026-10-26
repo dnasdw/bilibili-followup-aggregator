@@ -2,7 +2,7 @@
 // @name         B站关注动态聚合器 - 视频补课与增量归档
 // @name:en      Bilibili Follow Feed Aggregator - Video Backfill & Incremental Archive
 // @namespace    https://github.com/dnasdw
-// @version      2.8.5
+// @version      2.8.6
 // @description  聚合全部关注UP主的视频动态（正式投稿+动态视频），按发布时间重建完整时间线。绕过B站关注动态页只能回看约75天历史的限制：支持从任意日期回溯补课（可扫到每个UP的第一条动态）、增量归档、断点续扫、新关注UP自动补全；追番追剧与订阅合集同步入库；联合投稿自动识别主UP主；观看历史本地存档（全类型收录，不受官方自动删除影响）；多设备迁移
 // @description:en  Aggregate video dynamics (uploads + dynamic videos) from all followed creators into one timeline. Bypasses bilibili's ~75-day follow-feed history limit: backfill from any date (down to each creator's very first post), incremental updates, resumable scans, auto-backfill for newly followed creators; bangumi/drama and subscribed seasons synced in; joint uploads attributed to the primary uploader; watch history archived locally (all item types, immune to server-side auto-deletion); JSON export/import for migration.
 // @author       dnasdw
@@ -2032,7 +2032,11 @@
             return Number.isFinite(n) && n >= 1 ? n : 1;
         },
 
-        renderList(page) {
+        /** renderList(page, keepScroll): rebuild the page slice. keepScroll
+         *  restores the previous scroll offset after in-place refreshes (e.g.
+         *  deleting a history entry) so the viewport never jumps to the top;
+         *  page switches keep the reset-to-top behavior. */
+        renderList(page, keepScroll) {
             const state = Store.load();
             const tab = this.currentTab || this.loadTab();
             const list = Core.tabList(state.videos, tab);
@@ -2041,7 +2045,7 @@
             this.currentPage = page;
             this.savePage(page);
             const slice = list.slice((page - 1) * CONFIG.listPageSize, page * CONFIG.listPageSize);
-            this.els.list.scrollTop = 0; // reset scroll position on page change
+            const prevScroll = keepScroll ? this.els.list.scrollTop : 0;
 
             this.els.list.innerHTML = '';
             if (!slice.length) {
@@ -2184,6 +2188,8 @@
                 jumpInput,
                 jumpBtn,
             );
+
+            this.els.list.scrollTop = prevScroll; // top on page switch, restored on in-place refresh
         },
 
         /** Drop the local history tag of one entry (user clicked ✕ on a card).
@@ -2197,7 +2203,7 @@
             Store.save(state);
             this.log(`已删除本地历史记录 ${bvid}（B站云端记录不受影响）`);
             this.renderStats();
-            this.renderList(this.currentPage);
+            this.renderList(this.currentPage, true); // in-place refresh: keep scroll position
         },
 
         async importJson(file) {
