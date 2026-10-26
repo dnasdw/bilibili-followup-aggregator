@@ -2,7 +2,7 @@
 // @name         B站关注动态聚合器 - 视频补课与增量归档
 // @name:en      Bilibili Follow Feed Aggregator - Video Backfill & Incremental Archive
 // @namespace    https://github.com/dnasdw
-// @version      2.8.2
+// @version      2.8.4
 // @description  聚合全部关注UP主的视频动态（正式投稿+动态视频），按发布时间重建完整时间线。绕过B站关注动态页只能回看约75天历史的限制：支持从任意日期回溯补课（可扫到每个UP的第一条动态）、增量归档、断点续扫、新关注UP自动补全；追番追剧与订阅合集同步入库；联合投稿自动识别主UP主；观看历史本地存档（全类型收录，不受官方自动删除影响）；多设备迁移
 // @description:en  Aggregate video dynamics (uploads + dynamic videos) from all followed creators into one timeline. Bypasses bilibili's ~75-day follow-feed history limit: backfill from any date (down to each creator's very first post), incremental updates, resumable scans, auto-backfill for newly followed creators; bangumi/drama and subscribed seasons synced in; joint uploads attributed to the primary uploader; watch history archived locally (all item types, immune to server-side auto-deletion); JSON export/import for migration.
 // @author       dnasdw
@@ -1570,22 +1570,33 @@
             }
         },
 
-        /** Insert the button into the card's info column: on the line right
-         *  below the official right-actions row (fav-status + delete-btn),
-         *  right-aligned. Card layout on www.bilibili.com/history:
+        /** Insert the button as a SIBLING of right-actions (both children of
+         *  .info__top), rendered on its own line BELOW the actions row,
+         *  right-aligned - never squeezed into the actions row itself, never
+         *  overlaying the cover. Card layout on www.bilibili.com/history:
          *    .history-card > .history-card__right > .info__top (title +
          *    .right-actions [fav-status?, delete-btn]) + .info__bottom. */
         placeButton(a, btn) {
             const card = (typeof a.closest === 'function' && a.closest('.history-card')) || this.findCard(a);
             if (!card) return;
             if (card.querySelector('.bfua-sync-del')) return; // already injected
-            const infoTop = card.querySelector('.info__top');
-            if (infoTop && infoTop.parentElement) {
-                infoTop.insertAdjacentElement('afterend', btn); // line below right-actions
-            } else if (card.querySelector('.right-actions')) {
-                card.querySelector('.right-actions').insertAdjacentElement('afterend', btn);
+            const row = document.createElement('div');
+            row.className = 'bfua-sync-del-row';
+            row.appendChild(btn);
+            const actions = card.querySelector('.right-actions');
+            if (actions && actions.parentElement) {
+                const top = actions.parentElement; // .info__top
+                // a full-width row only lands BELOW the actions when the
+                // container wraps; enable that without touching anything else
+                try {
+                    const d = getComputedStyle(top).display;
+                    if (d === 'flex' || d === 'inline-flex') top.style.flexWrap = 'wrap';
+                } catch (e) { /* detached */ }
+                actions.insertAdjacentElement('afterend', row);
+            } else if (card.querySelector('.info__top')) {
+                card.querySelector('.info__top').appendChild(row);
             } else {
-                card.appendChild(btn); // in-flow fallback: never overlays content
+                card.appendChild(row); // in-flow fallback: never overlays content
             }
         },
 
@@ -1685,7 +1696,8 @@
 .bfua-dur{color:#9499a0;font-size:12px;margin-left:auto;flex:0 0 auto}
 .bfua-del{border:1px solid #e3e5e7;background:#fff;color:#61666d;border-radius:6px;padding:3px 10px;font-size:12px;cursor:pointer;flex:0 0 auto;margin-left:6px}
 .bfua-del:hover{color:#e0533d;border-color:#ffb4a8}
-.bfua-sync-del{display:block;width:fit-content;margin:4px 0 0 auto;border:1px solid #e3e5e7;background:rgba(255,255,255,.92);color:#61666d;border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer}
+.bfua-sync-del-row{flex-basis:100%;width:100%;display:flex;justify-content:flex-end;margin-top:2px}
+.bfua-sync-del{border:1px solid #e3e5e7;background:rgba(255,255,255,.92);color:#61666d;border-radius:6px;padding:2px 8px;font-size:12px;cursor:pointer}
 .bfua-sync-del:hover{color:#e0533d;border-color:#ffb4a8}
 .bfua-sync-del:disabled{opacity:.5;cursor:default}
 .bfua-title{font-size:13.5px;margin:3px 0;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
