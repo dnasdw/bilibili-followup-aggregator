@@ -2,7 +2,7 @@
 // @name         B站关注动态聚合器 - 视频补课与增量归档
 // @name:en      Bilibili Follow Feed Aggregator - Video Backfill & Incremental Archive
 // @namespace    https://github.com/dnasdw
-// @version      2.8.6
+// @version      2.8.7
 // @description  聚合全部关注UP主的视频动态（正式投稿+动态视频），按发布时间重建完整时间线。绕过B站关注动态页只能回看约75天历史的限制：支持从任意日期回溯补课（可扫到每个UP的第一条动态）、增量归档、断点续扫、新关注UP自动补全；追番追剧与订阅合集同步入库；联合投稿自动识别主UP主；观看历史本地存档（全类型收录，不受官方自动删除影响）；多设备迁移
 // @description:en  Aggregate video dynamics (uploads + dynamic videos) from all followed creators into one timeline. Bypasses bilibili's ~75-day follow-feed history limit: backfill from any date (down to each creator's very first post), incremental updates, resumable scans, auto-backfill for newly followed creators; bangumi/drama and subscribed seasons synced in; joint uploads attributed to the primary uploader; watch history archived locally (all item types, immune to server-side auto-deletion); JSON export/import for migration.
 // @author       dnasdw
@@ -1551,15 +1551,42 @@
             return null;
         },
 
+        /** Local state for the has-local-record check, cached briefly so the
+         *  observer's frequent inject() runs don't re-parse the big store. */
+        loadState() {
+            const now = Date.now();
+            if (!this._state || now - this._stateAt > 1000) {
+                this._state = Store.load();
+                this._stateAt = now;
+            }
+            return this._state;
+        },
+
         inject() {
+            const state = this.loadState();
             const links = document.querySelectorAll(
                 'a[href*="/video/BV"], a[href*="live.bilibili.com/"], a[href*="/read/cv"], a[href*="/bangumi/play/ep"]'
             );
             for (const a of links) {
-                if (a.dataset.bfuaDone) continue;
-                a.dataset.bfuaDone = '1';
                 const t = this.parseTarget(a.getAttribute('href') || '');
                 if (!t) continue;
+                const card = (typeof a.closest === 'function' && a.closest('.history-card')) || this.findCard(a);
+                if (!card) continue;
+
+                // the button only makes sense when BOTH sides have the record;
+                // cloud-only entries would need a slow detail lookup first
+                const rec = state.videos[t.id];
+                const hasLocal = !!rec && (rec.sources || []).indexOf('history') !== -1;
+
+                const existing = card.querySelector('.bfua-sync-del');
+                if (existing) {
+                    // local record gone (deleted elsewhere) -> button goes too;
+                    // in-flight deletions keep their button until settled
+                    if (!hasLocal && existing.dataset.bfuaBusy !== '1') existing.remove();
+                    continue;
+                }
+                if (!hasLocal) continue;
+
                 const btn = document.createElement('button');
                 btn.type = 'button';
                 btn.className = 'bfua-sync-del';
@@ -1616,6 +1643,7 @@
         async deleteBoth(t, btn) {
             if (!confirm('同时删除B站云端与本插件本地的这条历史记录？')) return;
             btn.disabled = true;
+            btn.dataset.bfuaBusy = '1';
             try {
                 const state = Store.load();
                 const rec = state.videos[t.id];
@@ -1630,19 +1658,22 @@
                 if (!kid) {
                     UI.log('无法确定该条目的云端标识（本地尚未入库，且类型无法从链接推断），请先执行一次增量更新', 'warn');
                     btn.disabled = false;
+                    delete btn.dataset.bfuaBusy;
                     return;
                 }
                 const csrf = getCsrf();
-                if (!csrf) { UI.log('未读取到 bili_jct（登录态失效？），无法删除云端记录', 'warn'); btn.disabled = false; return; }
+                if (!csrf) { UI.log('未读取到 bili_jct（登录态失效？），无法删除云端记录', 'warn'); btn.disabled = false; delete btn.dataset.bfuaBusy; return; }
                 const res = await apiPostForm(API.historyDelete, { kid, csrf }, 'https://www.bilibili.com/history');
-                if (res.code !== 0) { UI.log(`云端历史删除失败：${res.message || res.code}`, 'error'); btn.disabled = false; return; }
+                if (res.code !== 0) { UI.log(`云端历史删除失败：${res.message || res.code}`, 'error'); btn.disabled = false; delete btn.dataset.bfuaBusy; return; }
                 Core.removeHistorySource(state, t.id);
                 Store.save(state);
                 UI.log(`已同时删除云端与本地历史（${kid}）`);
-                btn.textContent = '已删除';
+                this._state = null; // drop the cache: the local record is gone
+                btn.remove();       // dynamic display: no local record -> no button
             } catch (e) {
                 UI.log(`同步删除失败：${e.message}`, 'error');
                 btn.disabled = false;
+                delete btn.dataset.bfuaBusy;
             }
         },
     };
