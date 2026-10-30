@@ -2,7 +2,7 @@
 // @name         B站关注动态聚合器 - 视频补课与增量归档
 // @name:en      Bilibili Follow Feed Aggregator - Video Backfill & Incremental Archive
 // @namespace    https://github.com/dnasdw
-// @version      2.8.7
+// @version      2.8.8
 // @description  聚合全部关注UP主的视频动态（正式投稿+动态视频），按发布时间重建完整时间线。绕过B站关注动态页只能回看约75天历史的限制：支持从任意日期回溯补课（可扫到每个UP的第一条动态）、增量归档、断点续扫、新关注UP自动补全；追番追剧与订阅合集同步入库；联合投稿自动识别主UP主；观看历史本地存档（全类型收录，不受官方自动删除影响）；多设备迁移
 // @description:en  Aggregate video dynamics (uploads + dynamic videos) from all followed creators into one timeline. Bypasses bilibili's ~75-day follow-feed history limit: backfill from any date (down to each creator's very first post), incremental updates, resumable scans, auto-backfill for newly followed creators; bangumi/drama and subscribed seasons synced in; joint uploads attributed to the primary uploader; watch history archived locally (all item types, immune to server-side auto-deletion); JSON export/import for migration.
 // @author       dnasdw
@@ -1568,10 +1568,19 @@
                 'a[href*="/video/BV"], a[href*="live.bilibili.com/"], a[href*="/read/cv"], a[href*="/bangumi/play/ep"]'
             );
             for (const a of links) {
+                // STRICTLY official history cards. The extension panel renders
+                // its own /video/BV links and must never enter this path: the
+                // old heuristic fallback (findCard) resolved to different
+                // ancestors depending on layout timing, so re-evaluation kept
+                // "not finding" the injected button, re-injecting it forever -
+                // each insert fired the MutationObserver again and froze the
+                // page. closest() only; if bilibili renames the card class the
+                // buttons just disappear (safe degradation).
+                const card = typeof a.closest === 'function' && a.closest('.history-card');
+                if (!card) continue;
+
                 const t = this.parseTarget(a.getAttribute('href') || '');
                 if (!t) continue;
-                const card = (typeof a.closest === 'function' && a.closest('.history-card')) || this.findCard(a);
-                if (!card) continue;
 
                 // the button only makes sense when BOTH sides have the record;
                 // cloud-only entries would need a slow detail lookup first
@@ -1597,7 +1606,7 @@
                     e.stopPropagation();
                     this.deleteBoth(t, btn);
                 });
-                this.placeButton(a, btn);
+                this.placeButton(card, btn);
             }
         },
 
@@ -1610,33 +1619,15 @@
          *  height, so info__bottom never shifts down. Long titles keep their
          *  80px reserved corner; short-title cards float it over the empty
          *  right side of info__bottom (its metas are left fit-content). */
-        placeButton(a, btn) {
-            const card = (typeof a.closest === 'function' && a.closest('.history-card')) || this.findCard(a);
-            if (!card) return;
+        placeButton(card, btn) {
             if (card.querySelector('.bfua-sync-del')) return; // already injected
             const top = card.querySelector('.info__top');
             if (top) {
                 top.appendChild(btn); // absolute like right-actions, anchored by info__top{position:relative}
-            } else if (card.querySelector('.right-actions') && card.querySelector('.right-actions').parentElement) {
-                card.querySelector('.right-actions').parentElement.appendChild(btn);
             } else {
-                btn.style.position = 'static'; // unknown layout: in-flow, never overlays
+                btn.style.position = 'static'; // layout changed: in-flow, never overlays
                 card.appendChild(btn);
             }
-        },
-
-        /** Heuristic card container: nearest ancestor that has an image and
-         *  spans like a card. Falls back to the link's parent so the button
-         *  keeps working (possibly less pretty) through bilibili redesigns. */
-        findCard(a) {
-            let el = a;
-            for (let i = 0; i < 6 && el.parentElement; i++) {
-                el = el.parentElement;
-                try {
-                    if (el.querySelector('img') && el.children.length >= 2 && el.getBoundingClientRect().height > 40) return el;
-                } catch (e) { /* detached node */ }
-            }
-            return null;
         },
 
         /** Delete one history entry both cloud-side and locally. */
